@@ -61,42 +61,55 @@ public class ContractGeneratorService {
             throw new FileNotFoundException("模板文件不存在: " + templateFile);
         }
 
-        Files.createDirectories(outputPath);
+        int totalSuccess = 0;
+        try (InputStream is = Files.newInputStream(dataFile);
+             Workbook workbook = openWorkbook(is, dataFile)) {
 
-        List<Map<String, String>> rows = readDataSheet(dataFile);
-        log.info("从 {} 读取到 {} 行数据", dataFile, rows.size());
-        if (!rows.isEmpty()) {
-            log.info("数据表列名（可用于 output-file-name-pattern）: {}", rows.get(0).keySet());
-        }
+            for (int sheetIndex = 0; sheetIndex < workbook.getNumberOfSheets(); sheetIndex++) {
+                Sheet sheet = workbook.getSheetAt(sheetIndex);
+                String sheetName = sheet.getSheetName();
+                String folderName = sanitizeFolderName(sheetName);
+                Path sheetOutputPath = outputPath.resolve(folderName);
+                Files.createDirectories(sheetOutputPath);
 
-        if (rows.isEmpty()) {
-            log.warn("数据表为空，无合同可生成");
-            return 0;
-        }
+                List<Map<String, String>> rows = readDataFromSheet(sheet);
+                log.info("Sheet [{}] 读取到 {} 行数据，输出目录: {}", sheetName, rows.size(), sheetOutputPath);
+                if (!rows.isEmpty()) {
+                    log.info("数据表列名（可用于 output-file-name-pattern）: {}", rows.get(0).keySet());
+                }
 
-        Map<String, Integer> contractSeqMap = new HashMap<>();
-        int successCount = 0;
-        Set<String> usedFileNames = new HashSet<>();
-        for (int i = 0; i < rows.size(); i++) {
-            Map<String, String> rowData = new LinkedHashMap<>(rows.get(i));
-            String contractNo = generateContractNumber(rowData, contractSeqMap);
-            rowData.put("合同编号", contractNo);
+                if (rows.isEmpty()) {
+                    log.warn("Sheet [{}] 无数据，跳过", sheetName);
+                    continue;
+                }
 
-            try {
-                String outputFileName = resolveFileName(rowData, config.getOutputFileNamePattern());
-                outputFileName = ensureUniqueFileName(outputFileName, usedFileNames, i + 1);
-                usedFileNames.add(outputFileName);
-                Path outputFile = outputPath.resolve(outputFileName);
-                fillAndSave(templateFile, rowData, outputFile);
-                log.info("[{}/{}] 已生成: {}", i + 1, rows.size(), outputFileName);
-                successCount++;
-            } catch (Exception e) {
-                log.error("第 {} 行生成失败: {}", i + 2, e.getMessage(), e);
+                Map<String, Integer> contractSeqMap = new HashMap<>();
+                Set<String> usedFileNames = new HashSet<>();
+                for (int i = 0; i < rows.size(); i++) {
+                    Map<String, String> rowData = new LinkedHashMap<>(rows.get(i));
+                    // 供方简称、需方简称：直接取供方、需方的前四个字
+                    rowData.put("供方简称", firstFourChars(getColumnValue(rowData, "供方", "供方/发货单位", "供方／发货单位")));
+                    rowData.put("需方简称", firstFourChars(getColumnValue(rowData, "需方", "需方/提货单位", "需方／提货单位")));
+                    String contractNo = generateContractNumber(rowData, contractSeqMap);
+                    rowData.put("合同编号", contractNo);
+
+                    try {
+                        String outputFileName = resolveFileName(rowData, config.getOutputFileNamePattern());
+                        outputFileName = ensureUniqueFileName(outputFileName, usedFileNames, i + 1);
+                        usedFileNames.add(outputFileName);
+                        Path outputFile = sheetOutputPath.resolve(outputFileName);
+                        fillAndSave(templateFile, rowData, outputFile);
+                        log.info("[{}] [{}/{}] 已生成: {}", sheetName, i + 1, rows.size(), outputFileName);
+                        totalSuccess++;
+                    } catch (Exception e) {
+                        log.error("Sheet [{}] 第 {} 行生成失败: {}", sheetName, i + 2, e.getMessage(), e);
+                    }
+                }
             }
         }
 
-        log.info("批量生成完成，成功 {}/{} 个合同，输出目录: {}", successCount, rows.size(), outputPath);
-        return successCount;
+        log.info("批量生成完成，共成功 {} 个合同，输出目录: {}", totalSuccess, outputPath);
+        return totalSuccess;
     }
 
     /**
@@ -156,6 +169,28 @@ public class ContractGeneratorService {
         return sb.toString();
     }
 
+    /** 取字符串前四个字（不足则返回全文），空则返回 "" */
+    private static String firstFourChars(String s) {
+        if (s == null || s.isEmpty()) return "";
+        s = s.trim();
+        return s.length() <= 4 ? s : s.substring(0, 4);
+    }
+
+    /** 从 rowData 中按多个可能的列名取值，兼容供方/供方／发货单位等 */
+    private static String getColumnValue(Map<String, String> rowData, String... keys) {
+        for (String key : keys) {
+            String v = rowData.get(key);
+            if (v != null && !v.trim().isEmpty()) return v.trim();
+        }
+        return "";
+    }
+
+    /** 将 sheet 名称转为可作文件夹名的字符串，去掉非法路径字符 */
+    private static String sanitizeFolderName(String sheetName) {
+        if (sheetName == null) return "sheet";
+        return sheetName.replaceAll("[\\\\/:*?\"<>|]", "_").trim();
+    }
+
     /** 按文件内容判断格式：xlsx 以 PK 开头，xls 为 OLE2 */
     private Workbook openWorkbook(InputStream is, Path file) throws IOException {
         PushbackInputStream pis = new PushbackInputStream(is, 8);
@@ -167,41 +202,35 @@ public class ContractGeneratorService {
     }
 
     /**
-     * 读取数据表第一个 sheet，第一行为表头
+     * 读取指定 sheet 的数据，第一行为表头
      */
-    private List<Map<String, String>> readDataSheet(Path dataFile) throws IOException {
+    private List<Map<String, String>> readDataFromSheet(Sheet sheet) {
         List<Map<String, String>> rows = new ArrayList<>();
+        if (sheet == null || sheet.getPhysicalNumberOfRows() < 2) {
+            return rows;
+        }
 
-        try (InputStream is = Files.newInputStream(dataFile);
-             Workbook workbook = openWorkbook(is, dataFile)) {
+        Row headerRow = sheet.getRow(0);
+        List<String> headers = new ArrayList<>();
+        for (Cell cell : headerRow) {
+            headers.add(getCellStringValue(cell, null));
+        }
 
-            Sheet sheet = workbook.getSheetAt(0);
-            if (sheet == null || sheet.getPhysicalNumberOfRows() < 2) {
-                return rows;
-            }
+        for (int r = 1; r <= sheet.getLastRowNum(); r++) {
+            Row row = sheet.getRow(r);
+            if (row == null) continue;
 
-            Row headerRow = sheet.getRow(0);
-            List<String> headers = new ArrayList<>();
-            for (Cell cell : headerRow) {
-                headers.add(getCellStringValue(cell, null));
-            }
-
-            for (int r = 1; r <= sheet.getLastRowNum(); r++) {
-                Row row = sheet.getRow(r);
-                if (row == null) continue;
-
-                Map<String, String> rowData = new LinkedHashMap<>();
-                for (int c = 0; c < headers.size(); c++) {
-                    String header = headers.get(c);
-                    if (header == null || header.trim().isEmpty()) {
-                        header = "col" + c;
-                    }
-                    Cell cell = row.getCell(c);
-                    String colName = header.trim();
-                    rowData.put(colName, cell != null ? getCellStringValue(cell, colName) : "");
+            Map<String, String> rowData = new LinkedHashMap<>();
+            for (int c = 0; c < headers.size(); c++) {
+                String header = headers.get(c);
+                if (header == null || header.trim().isEmpty()) {
+                    header = "col" + c;
                 }
-                rows.add(rowData);
+                Cell cell = row.getCell(c);
+                String colName = header.trim();
+                rowData.put(colName, cell != null ? getCellStringValue(cell, colName) : "");
             }
+            rows.add(rowData);
         }
         return rows;
     }

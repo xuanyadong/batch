@@ -29,6 +29,9 @@ import java.util.regex.Pattern;
 /**
  * 提单批量生成服务
  * 从数据表读取每一行，替换占位符，填充内置表格（数量拆分后逐行）
+ * <p>
+ * 卡号全局对应：同一公司作为需方收货的卡号总量 = 作为供方发货的卡号总量，
+ * 保证收货/发货的卡号能够一一对应。
  */
 @Service
 public class BillOfLadingService {
@@ -36,6 +39,7 @@ public class BillOfLadingService {
     private static final Logger log = LoggerFactory.getLogger(BillOfLadingService.class);
 
     private static final int PIECES_MULTIPLIER = 40;
+    private static final int ALLOCATION_RETRY_LIMIT = 20;
 
     /** 表格列：产品名 规格型号 卡号 数量（吨） 件数 备注 */
     private static final String[] TABLE_HEADERS = {"产品名", "规格型号", "卡号", "数量（吨）", "件数", "备注"};
@@ -67,6 +71,9 @@ public class BillOfLadingService {
             return 0;
         }
 
+        // 预计算：按 (公司, 规格型号) 建立卡号库存，并预分配每行的卡号明细
+        CardAllocationContext ctx = buildCardAllocationContext(rows);
+
         Map<String, Integer> seqMap = new HashMap<>();
         int successCount = 0;
         Set<String> usedFileNames = new HashSet<>();
@@ -82,7 +89,7 @@ public class BillOfLadingService {
                 outputFileName = ensureUniqueFileName(outputFileName, usedFileNames, i + 1);
                 usedFileNames.add(outputFileName);
                 Path outputFile = outputPath.resolve(outputFileName);
-                fillAndSave(templateFile, rowData, outputFile);
+                fillAndSave(templateFile, rowData, outputFile, ctx, i);
                 log.info("[{}/{}] 已生成: {}", i + 1, rows.size(), outputFileName);
                 successCount++;
             } catch (Exception e) {
@@ -92,6 +99,217 @@ public class BillOfLadingService {
 
         log.info("提单批量生成完成，成功 {}/{} 个，输出目录: {}", successCount, rows.size(), outputPath);
         return successCount;
+    }
+
+    /**
+     * 预计算卡号分配：按 (供方, 规格型号) 建立库存，为每行预分配 (卡号, 数量) 列表
+     */
+    private CardAllocationContext buildCardAllocationContext(List<Map<String, String>> rows) {
+        int min = config.getSplitMin();
+        int max = config.getSplitMax();
+        int maxSubCount = config.getSplitMaxSubCount();
+
+        // 按 (供方, 规格型号) 分组发货行
+        Map<String, List<RowRef>> shipmentByCompanySpec = new LinkedHashMap<>();
+        for (int i = 0; i < rows.size(); i++) {
+            Map<String, String> row = rows.get(i);
+            String gongFang = emptyToBlank(getColumnValue(row, "供方/发货单位", "供方／发货单位"));
+            String specModel = emptyToBlank(getColumnValue(row, "规格型号"));
+            int qty = (int) Math.round(parseQuantity(row));
+            if (gongFang.isEmpty() || qty <= 0) continue;
+            String key = gongFang + "|" + specModel;
+            shipmentByCompanySpec.computeIfAbsent(key, k -> new ArrayList<>()).add(new RowRef(i, qty, row));
+        }
+
+        // 对每个 (供方, 规格型号)：按收货行收集数量，每行若超过 splitMax 则拆成多张卡（每张在 [splitMin, splitMax]），保证收=发且每项满足限制
+        Map<String, Map<String, Integer>> inventoryByCompanySpec = new HashMap<>();
+        for (String key : shipmentByCompanySpec.keySet()) {
+            String[] parts = key.split("\\|", 2);
+            String company = parts[0];
+            String specModel = parts[1];
+
+            List<Integer> receiptRowQtys = new ArrayList<>();
+            for (Map<String, String> row : rows) {
+                String xuFang = emptyToBlank(getColumnValue(row, "需方/提货单位", "需方／提货单位"));
+                String spec = emptyToBlank(getColumnValue(row, "规格型号"));
+                if (xuFang.equals(company) && spec.equals(specModel)) {
+                    int q = (int) Math.round(parseQuantity(row));
+                    if (q > 0) receiptRowQtys.add(q);
+                }
+            }
+
+            if (receiptRowQtys.isEmpty()) continue;
+
+            // 每行数量若 > splitMax 则用 OrderSplitUtil 拆成多张卡（每张在 [min,max]）；否则一行一卡
+            List<Integer> cardQtys = new ArrayList<>();
+            for (Integer rowQty : receiptRowQtys) {
+                if (rowQty <= max) {
+                    cardQtys.add(rowQty);
+                } else {
+                    try {
+                        cardQtys.addAll(OrderSplitUtil.split(rowQty, min, max, maxSubCount));
+                    } catch (IllegalArgumentException e) {
+                        log.warn("{} 收货行数量 {} 拆单失败: {}，按单卡处理", key, rowQty, e.getMessage());
+                        cardQtys.add(rowQty);
+                    }
+                }
+            }
+
+            Map<String, Integer> inventory = new LinkedHashMap<>();
+            for (int j = 0; j < cardQtys.size(); j++) {
+                String cardNo = specModel + "-" + (j + 1);
+                inventory.put(cardNo, cardQtys.get(j));
+            }
+            inventoryByCompanySpec.put(key, inventory);
+        }
+
+        // 为每行分配 (卡号, 数量)：严格按数据表行顺序处理，从对应 (供方,规格) 的库存中扣减
+        List<List<CardQty>> rowAllocations = new ArrayList<>(rows.size());
+        for (int i = 0; i < rows.size(); i++) {
+            rowAllocations.add(null);
+        }
+
+        Map<String, Map<String, Integer>> mutableInventory = new HashMap<>();
+        for (Map.Entry<String, Map<String, Integer>> e : inventoryByCompanySpec.entrySet()) {
+            Map<String, Integer> copy = new LinkedHashMap<>();
+            for (Map.Entry<String, Integer> e2 : e.getValue().entrySet()) {
+                copy.put(e2.getKey(), e2.getValue());
+            }
+            mutableInventory.put(e.getKey(), copy);
+        }
+
+        for (int rowIndex = 0; rowIndex < rows.size(); rowIndex++) {
+            Map<String, String> row = rows.get(rowIndex);
+            String gongFang = emptyToBlank(getColumnValue(row, "供方/发货单位", "供方／发货单位"));
+            String specModel = emptyToBlank(getColumnValue(row, "规格型号"));
+            int qty = (int) Math.round(parseQuantity(row));
+            if (gongFang.isEmpty() || qty <= 0) continue;
+
+            String key = gongFang + "|" + specModel;
+            Map<String, Integer> inv = mutableInventory.get(key);
+            if (inv == null) continue;
+
+            List<CardQty> allocation = allocateFromInventory(qty, inv, min, max, maxSubCount);
+            if (allocation != null) {
+                rowAllocations.set(rowIndex, allocation);
+                for (CardQty cq : allocation) {
+                    int remain = inv.getOrDefault(cq.cardNo, 0) - cq.qty;
+                    if (remain <= 0) {
+                        inv.remove(cq.cardNo);
+                    } else {
+                        inv.put(cq.cardNo, remain);
+                    }
+                }
+            } else {
+                log.warn("第 {} 行分配失败，回退到单行独立拆分", rowIndex + 2);
+                rowAllocations.set(rowIndex, null);
+            }
+        }
+
+        return new CardAllocationContext(rowAllocations);
+    }
+
+    /**
+     * 从库存中分配 target 数量，返回 (卡号, 数量) 列表。
+     * 只从现有卡号库存扣减，不重新拆分，保证每个卡号「收货=发货」且总数量一致；
+     * 单张提单内同一卡号只出现一次，数量互不重复。
+     */
+    private List<CardQty> allocateFromInventory(int target, Map<String, Integer> inventory,
+                                                int min, int max, int maxSubCount) {
+        if (target <= 0 || inventory.isEmpty()) return Collections.emptyList();
+
+        int totalAvail = inventory.values().stream().mapToInt(Integer::intValue).sum();
+        if (totalAvail < target) return null;
+
+        // 按数量从大到小排序，优先用大卡
+        List<Map.Entry<String, Integer>> cards = new ArrayList<>(inventory.entrySet());
+        cards.sort((a, b) -> Integer.compare(b.getValue(), a.getValue()));
+
+        List<CardQty> result = new ArrayList<>();
+        Set<Integer> usedAmounts = new HashSet<>();
+        int sum = 0;
+
+        for (Map.Entry<String, Integer> e : cards) {
+            if (sum == target) break;
+            String cardNo = e.getKey();
+            int qty = e.getValue();
+            int need = target - sum;
+
+            if (need <= 0) break;
+
+            int takeAmt;
+            if (qty <= need) {
+                takeAmt = qty;
+            } else {
+                takeAmt = need;
+                while (usedAmounts.contains(takeAmt) && takeAmt < qty) takeAmt++;
+                if (usedAmounts.contains(takeAmt)) {
+                    takeAmt = need;
+                    while (takeAmt > 0 && usedAmounts.contains(takeAmt)) takeAmt--;
+                    if (takeAmt <= 0) continue;
+                }
+            }
+
+            result.add(new CardQty(cardNo, takeAmt));
+            usedAmounts.add(takeAmt);
+            sum += takeAmt;
+        }
+
+        if (sum != target) {
+            if (sum < target) return null;
+            int diff = sum - target;
+            for (int i = result.size() - 1; i >= 0; i--) {
+                CardQty cq = result.get(i);
+                if (cq.qty <= diff) continue;
+                int newQty = cq.qty - diff;
+                usedAmounts.remove(cq.qty);
+                if (!usedAmounts.contains(newQty)) {
+                    result.set(i, new CardQty(cq.cardNo, newQty));
+                    usedAmounts.add(newQty);
+                    sum = target;
+                    break;
+                }
+                usedAmounts.add(cq.qty);
+            }
+            if (sum != target) return null;
+        }
+
+        return result.isEmpty() ? null : result;
+    }
+
+    private static class RowRef {
+        final int rowIndex;
+        final int qty;
+        final Map<String, String> rowData;
+
+        RowRef(int rowIndex, int qty, Map<String, String> rowData) {
+            this.rowIndex = rowIndex;
+            this.qty = qty;
+            this.rowData = rowData;
+        }
+    }
+
+    private static class CardQty {
+        final String cardNo;
+        final int qty;
+
+        CardQty(String cardNo, int qty) {
+            this.cardNo = cardNo;
+            this.qty = qty;
+        }
+    }
+
+    private static class CardAllocationContext {
+        final List<List<CardQty>> rowAllocations;
+
+        CardAllocationContext(List<List<CardQty>> rowAllocations) {
+            this.rowAllocations = rowAllocations;
+        }
+
+        List<CardQty> getAllocation(int rowIndex) {
+            if (rowIndex < 0 || rowIndex >= rowAllocations.size()) return null;
+            return rowAllocations.get(rowIndex);
+        }
     }
 
     /**
@@ -183,7 +401,7 @@ public class BillOfLadingService {
     }
 
     /**
-     * 将数量拆分为若干份，使用 OrderSplitUtil，每份在 [splitMin, splitMax] 内互不重复，总和等于原数量。
+     * 单行独立拆分（回退逻辑）：将数量拆分为若干份，每份在 [splitMin, splitMax] 内互不重复
      */
     private List<Double> splitQuantity(double total) {
         if (total <= 0) return new ArrayList<>();
@@ -194,12 +412,16 @@ public class BillOfLadingService {
         if (totalInt < min) {
             return Collections.singletonList((double) totalInt);
         }
-        List<Integer> parts = OrderSplitUtil.split(totalInt, min, max, maxSubCount);
-        List<Double> result = new ArrayList<>(parts.size());
-        for (Integer p : parts) {
-            result.add(p.doubleValue());
+        try {
+            List<Integer> parts = OrderSplitUtil.split(totalInt, min, max, maxSubCount);
+            List<Double> result = new ArrayList<>(parts.size());
+            for (Integer p : parts) {
+                result.add(p.doubleValue());
+            }
+            return result;
+        } catch (IllegalArgumentException e) {
+            return Collections.singletonList((double) totalInt);
         }
-        return result;
     }
 
     private Workbook openWorkbook(InputStream is, Path file) throws IOException {
@@ -275,17 +497,14 @@ public class BillOfLadingService {
         return bd.stripTrailingZeros().toPlainString();
     }
 
-    private void fillAndSave(Path templateFile, Map<String, String> rowData, Path outputFile) throws IOException {
+    private void fillAndSave(Path templateFile, Map<String, String> rowData, Path outputFile,
+                             CardAllocationContext ctx, int rowIndex) throws IOException {
         try (InputStream is = Files.newInputStream(templateFile)) {
             Workbook workbook = openWorkbook(is, templateFile);
 
-            // 1. 先替换占位符（含 ${提单编号}）
             replacePlaceholders(workbook, rowData);
+            fillDetailTable(workbook, rowData, ctx, rowIndex);
 
-            // 2. 填充内置表格
-            fillDetailTable(workbook, rowData);
-
-            // 3. 触发公式重算，使模板中的 SUM 等函数生效
             FormulaEvaluator evaluator = workbook.getCreationHelper().createFormulaEvaluator();
             evaluator.evaluateAll();
             if (workbook instanceof org.apache.poi.xssf.usermodel.XSSFWorkbook) {
@@ -366,9 +585,10 @@ public class BillOfLadingService {
     }
 
     /**
-     * 查找表头行（产品名、规格型号、卡号、数量（吨）、件数、备注），并填充数据行
+     * 查找表头行并填充数据行。优先使用预计算的卡号分配（保证跨单卡号对应），否则回退到单行独立拆分。
      */
-    private void fillDetailTable(Workbook workbook, Map<String, String> rowData) {
+    private void fillDetailTable(Workbook workbook, Map<String, String> rowData,
+                                 CardAllocationContext ctx, int rowIndex) {
         Sheet sheet = workbook.getSheetAt(0);
         int headerRowIdx = findTableHeaderRow(sheet);
         if (headerRowIdx < 0) {
@@ -383,24 +603,62 @@ public class BillOfLadingService {
         String specModel = emptyToBlank(getColumnValue(rowData, "规格型号"));
         String xuFang = emptyToBlank(getColumnValue(rowData, "需方/提货单位", "需方／提货单位"));
 
-        double totalQty = parseQuantity(rowData);
-        List<Double> qtys = splitQuantity(totalQty);
+        List<CardQty> allocation = ctx != null ? ctx.getAllocation(rowIndex) : null;
+        if (allocation != null && !allocation.isEmpty()) {
+            // 为了可读性，按卡号尾号从小到大排序，例如 52518-1, 52518-2, ...
+            allocation.sort((a, b) -> {
+                String ca = a.cardNo;
+                String cb = b.cardNo;
+                int ia = ca.lastIndexOf('-');
+                int ib = cb.lastIndexOf('-');
+                String sa = ia >= 0 ? ca.substring(ia + 1) : ca;
+                String sb = ib >= 0 ? cb.substring(ib + 1) : cb;
+                try {
+                    int na = Integer.parseInt(sa);
+                    int nb = Integer.parseInt(sb);
+                    return Integer.compare(na, nb);
+                } catch (NumberFormatException e) {
+                    return ca.compareTo(cb);
+                }
+            });
+        }
+        List<Double> qtysForFallback = null;
 
         int firstDataRowIdx = headerRowIdx + 1;
-
         int templateLastRowIdx = firstDataRowIdx + 28;
         int dataRowCount;
-        if (qtys.isEmpty()) {
+
+        if (allocation == null || allocation.isEmpty()) {
+            qtysForFallback = splitQuantity(parseQuantity(rowData));
+            dataRowCount = qtysForFallback.isEmpty() ? 0 : qtysForFallback.size();
+        } else {
+            dataRowCount = allocation.size();
+        }
+
+        if (dataRowCount == 0) {
             writeTableRow(ensureRow(sheet, firstDataRowIdx), colIndices, productName, specModel,
                     specModel + "-1", 0, 0, "请过户至" + xuFang + specModel + "-1");
             dataRowCount = 1;
         } else {
             Row styleSourceRow = sheet.getRow(firstDataRowIdx);
-            for (int i = 0; i < qtys.size(); i++) {
-                double qty = qtys.get(i);
-                int pieceCount = (int) Math.round(qty * PIECES_MULTIPLIER);
-                String cardNo = specModel + "-" + (i + 1);
-                String remark = "请过户至" + xuFang + cardNo;
+            for (int i = 0; i < dataRowCount; i++) {
+                double qty;
+                int pieceCount;
+                String cardNo;
+                String remark;
+                if (allocation != null && !allocation.isEmpty()) {
+                    CardQty cq = allocation.get(i);
+                    qty = cq.qty;
+                    pieceCount = cq.qty * PIECES_MULTIPLIER;
+                    cardNo = cq.cardNo;
+                    remark = "请过户至" + xuFang + cq.cardNo;
+                } else {
+                    // 回退路径：使用预先计算好的 qtysForFallback，避免每次循环重新随机拆分导致长度不一致
+                    qty = qtysForFallback.get(i);
+                    pieceCount = (int) Math.round(qty * PIECES_MULTIPLIER);
+                    cardNo = specModel + "-" + (i + 1);
+                    remark = "请过户至" + xuFang + cardNo;
+                }
                 int targetRowIdx = firstDataRowIdx + i;
                 Row row;
                 if (targetRowIdx <= templateLastRowIdx) {
@@ -410,7 +668,6 @@ public class BillOfLadingService {
                 }
                 writeTableRow(row, colIndices, productName, specModel, cardNo, qty, pieceCount, remark);
             }
-            dataRowCount = qtys.size();
         }
         int lastDataRowIdx = firstDataRowIdx + dataRowCount - 1;
         updateSumFormulasToLastRow(sheet, lastDataRowIdx);
@@ -499,7 +756,6 @@ public class BillOfLadingService {
         return newRow;
     }
 
-    /** 将模板中与 sourceRow 相关的合并区域，复制到新行 newRow */
     private void copyMergedRegionsToRow(Sheet sheet, int sourceRow, int newRow) {
         List<CellRangeAddress> toAdd = new ArrayList<>();
         for (int i = 0; i < sheet.getNumMergedRegions(); i++) {
@@ -513,7 +769,6 @@ public class BillOfLadingService {
         }
     }
 
-    /** 将工作表中 SUM(…) 公式的引用末行改为 lastDataRowIdx+1（Excel 从 1 开始），使新增行参与合计 */
     private void updateSumFormulasToLastRow(Sheet sheet, int lastDataRowIdx) {
         int lastRowExcel = lastDataRowIdx + 1;
         Pattern rangePattern = Pattern.compile("(SUM\\()([^)]+)(\\))");
