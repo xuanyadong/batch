@@ -230,6 +230,10 @@ public class ContractGeneratorService {
                 String colName = header.trim();
                 rowData.put(colName, cell != null ? getCellStringValue(cell, colName) : "");
             }
+            // 跳过空行：供方/买方与需方/卖方都为空时不生成合同，避免产生“合同---X-X-日期-001”等空文档
+            String gongFang = emptyToBlank(getColumnValue(rowData, "供方", "供方/发货单位", "供方／发货单位", "卖方"));
+            String xuFang = emptyToBlank(getColumnValue(rowData, "需方", "需方/提货单位", "需方／提货单位", "买方"));
+            if (gongFang.isEmpty() && xuFang.isEmpty()) continue;
             rows.add(rowData);
         }
         return rows;

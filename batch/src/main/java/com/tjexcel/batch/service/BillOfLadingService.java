@@ -40,6 +40,11 @@ public class BillOfLadingService {
 
     private static final int PIECES_MULTIPLIER = 40;
     private static final int ALLOCATION_RETRY_LIMIT = 20;
+    /**
+     * 续收停止阈值：当卡累计量接近 split-max 时不再续收。
+     * 例如 split-max=495 时，达到 450+ 即视为接近满额，不再补齐到 495。
+     */
+    private static final int STOP_FILL_GAP = 45;
 
     /** 表格列：产品名 规格型号 卡号 数量（吨） 件数 备注 */
     private static final String[] TABLE_HEADERS = {"产品名", "规格型号", "卡号", "数量（吨）", "件数", "备注"};
@@ -53,7 +58,7 @@ public class BillOfLadingService {
     public int generate() throws IOException {
         Path dataFile = Paths.get(config.getDataPath()).toAbsolutePath();
         Path templateFile = Paths.get(config.getTemplatePath()).toAbsolutePath();
-        Path outputPath = Paths.get(config.getOutputDir()).toAbsolutePath();
+        Path outputRoot = Paths.get(config.getOutputDir()).toAbsolutePath();
 
         if (!Files.exists(dataFile)) {
             throw new FileNotFoundException("提单数据表不存在: " + dataFile);
@@ -62,230 +67,380 @@ public class BillOfLadingService {
             throw new FileNotFoundException("提单模板不存在: " + templateFile);
         }
 
-        Files.createDirectories(outputPath);
+        Files.createDirectories(outputRoot);
 
-        List<Map<String, String>> rows = readDataSheet(dataFile);
-        log.info("从 {} 读取到 {} 行提单数据", dataFile, rows.size());
-        if (rows.isEmpty()) {
-            log.warn("提单数据表为空，无提单可生成");
-            return 0;
-        }
+        int totalSuccess = 0;
 
-        // 预计算：按 (公司, 规格型号) 建立卡号库存，并预分配每行的卡号明细
-        CardAllocationContext ctx = buildCardAllocationContext(rows);
+        try (InputStream is = Files.newInputStream(dataFile);
+             Workbook workbook = openWorkbook(is, dataFile)) {
+            int sheetCount = workbook.getNumberOfSheets();
+            if (sheetCount <= 0) {
+                log.warn("提单数据表没有可用 sheet，无提单可生成");
+                return 0;
+            }
 
-        Map<String, Integer> seqMap = new HashMap<>();
-        int successCount = 0;
-        Set<String> usedFileNames = new HashSet<>();
-        for (int i = 0; i < rows.size(); i++) {
-            Map<String, String> rowData = new LinkedHashMap<>(rows.get(i));
-            String billNo = generateBillNumber(rowData, seqMap);
-            rowData.put("提单编号", billNo);
-            rowData.put("供方简称", firstFourChars(emptyToBlank(getColumnValue(rowData, "供方/发货单位", "供方／发货单位"))));
-            rowData.put("需方简称", firstFourChars(emptyToBlank(getColumnValue(rowData, "需方/提货单位", "需方／提货单位"))));
+            for (int s = 0; s < sheetCount; s++) {
+                Sheet sheet = workbook.getSheetAt(s);
+                if (sheet == null) continue;
+                String sheetName = sheet.getSheetName();
+                String safeSheetName = (sheetName == null || sheetName.trim().isEmpty())
+                        ? "sheet" + (s + 1)
+                        : sheetName.trim().replaceAll("[\\\\/:*?\"<>|]", "_");
+                Path sheetOutputDir = outputRoot.resolve(safeSheetName);
+                Files.createDirectories(sheetOutputDir);
 
-            try {
-                String outputFileName = resolveFileName(rowData, config.getOutputFileNamePattern());
-                outputFileName = ensureUniqueFileName(outputFileName, usedFileNames, i + 1);
-                usedFileNames.add(outputFileName);
-                Path outputFile = outputPath.resolve(outputFileName);
-                fillAndSave(templateFile, rowData, outputFile, ctx, i);
-                log.info("[{}/{}] 已生成: {}", i + 1, rows.size(), outputFileName);
-                successCount++;
-            } catch (Exception e) {
-                log.error("第 {} 行提单生成失败: {}", i + 2, e.getMessage(), e);
+                List<Map<String, String>> rows = readDataSheet(sheet);
+                log.info("从 {} 的 sheet[{}] 读取到 {} 行提单数据", dataFile, sheetName, rows.size());
+                if (rows.isEmpty()) {
+                    log.info("sheet[{}] 无有效提单数据，跳过生成", sheetName);
+                    continue;
+                }
+
+                // 预计算：按 (公司, 规格型号) 建立卡号库存，并预分配每行的卡号明细（仅针对当前 sheet）
+                CardAllocationContext ctx = buildCardAllocationContext(rows);
+
+                Map<String, Integer> seqMap = new HashMap<>();
+                int successCount = 0;
+                Set<String> usedFileNames = new HashSet<>();
+                for (int i = 0; i < rows.size(); i++) {
+                    Map<String, String> rowData = new LinkedHashMap<>(rows.get(i));
+                    String billNo = generateBillNumber(rowData, seqMap);
+                    rowData.put("提单编号", billNo);
+                    rowData.put("供方简称", firstFourChars(emptyToBlank(getColumnValue(rowData, "供方/发货单位", "供方／发货单位"))));
+                    rowData.put("需方简称", firstFourChars(emptyToBlank(getColumnValue(rowData, "需方/提货单位", "需方／提货单位"))));
+
+                    try {
+                        String outputFileName = resolveFileName(rowData, config.getOutputFileNamePattern());
+                        outputFileName = ensureUniqueFileName(outputFileName, usedFileNames, i + 1);
+                        usedFileNames.add(outputFileName);
+                        Path outputFile = sheetOutputDir.resolve(outputFileName);
+                        fillAndSave(templateFile, rowData, outputFile, ctx, i);
+                        log.info("[sheet {}] [{}/{}] 已生成: {}", sheetName, i + 1, rows.size(), outputFileName);
+                        successCount++;
+                    } catch (Exception e) {
+                        log.error("[sheet {}] 第 {} 行提单生成失败: {}", sheetName, i + 2, e.getMessage(), e);
+                    }
+                }
+
+                log.info("sheet[{}] 提单批量生成完成，成功 {}/{} 个，输出目录: {}", sheetName, successCount, rows.size(), sheetOutputDir);
+                totalSuccess += successCount;
             }
         }
 
-        log.info("提单批量生成完成，成功 {}/{} 个，输出目录: {}", successCount, rows.size(), outputPath);
-        return successCount;
+        log.info("提单批量生成完成，成功 {} 个，输出根目录: {}", totalSuccess, outputRoot);
+        return totalSuccess;
     }
 
     /**
-     * 预计算卡号分配：按 (供方, 规格型号) 建立库存，为每行预分配 (卡号, 数量) 列表
+     * 预计算卡号分配：按行顺序模拟整条链路的收发。
+     *
+     * 规则：
+     * - 每家公司作为需方收货时，从「上游供方的池」或外部创建池生成卡号，并加入自己的池；
+     * - 每家公司作为供方发货时，一律从自己的池中扣减（保证“收多少发多少”可追溯）；
+     * - 行内合计始终等于数据表原始数量；同一家公司同一规格下的卡总量尽量保持互不重复。
      */
     private CardAllocationContext buildCardAllocationContext(List<Map<String, String>> rows) {
+        log.info("[卡号分配] 开始 buildCardAllocationContext 总行数={}", rows.size());
         int min = config.getSplitMin();
         int max = config.getSplitMax();
         int maxSubCount = config.getSplitMaxSubCount();
 
-        // 按 (供方, 规格型号) 分组发货行
-        Map<String, List<RowRef>> shipmentByCompanySpec = new LinkedHashMap<>();
-        for (int i = 0; i < rows.size(); i++) {
-            Map<String, String> row = rows.get(i);
-            String gongFang = emptyToBlank(getColumnValue(row, "供方/发货单位", "供方／发货单位"));
-            String specModel = emptyToBlank(getColumnValue(row, "规格型号"));
-            int qty = (int) Math.round(parseQuantity(row));
-            if (gongFang.isEmpty() || qty <= 0) continue;
-            String key = gongFang + "|" + specModel;
-            shipmentByCompanySpec.computeIfAbsent(key, k -> new ArrayList<>()).add(new RowRef(i, qty, row));
-        }
+        // 每个 (公司, 规格) 的卡池：key = 公司|规格
+        Map<String, List<CardState>> poolsByCompany = new HashMap<>();
+        // 每个 (公司, 规格) 已使用过的“单卡数量”，用于避免重复数量
+        Map<String, Set<Integer>> usedAmountsByCompany = new HashMap<>();
 
-        // 对每个 (供方, 规格型号)：按收货行收集数量，每行若超过 splitMax 则拆成多张卡（每张在 [splitMin, splitMax]），保证收=发且每项满足限制
-        Map<String, Map<String, Integer>> inventoryByCompanySpec = new HashMap<>();
-        for (String key : shipmentByCompanySpec.keySet()) {
-            String[] parts = key.split("\\|", 2);
-            String company = parts[0];
-            String specModel = parts[1];
-
-            List<Integer> receiptRowQtys = new ArrayList<>();
-            for (Map<String, String> row : rows) {
-                String xuFang = emptyToBlank(getColumnValue(row, "需方/提货单位", "需方／提货单位"));
-                String spec = emptyToBlank(getColumnValue(row, "规格型号"));
-                if (xuFang.equals(company) && spec.equals(specModel)) {
-                    int q = (int) Math.round(parseQuantity(row));
-                    if (q > 0) receiptRowQtys.add(q);
-                }
-            }
-
-            if (receiptRowQtys.isEmpty()) continue;
-
-            // 每行数量若 > splitMax 则用 OrderSplitUtil 拆成多张卡（每张在 [min,max]）；否则一行一卡
-            List<Integer> cardQtys = new ArrayList<>();
-            for (Integer rowQty : receiptRowQtys) {
-                if (rowQty <= max) {
-                    cardQtys.add(rowQty);
-                } else {
-                    try {
-                        cardQtys.addAll(OrderSplitUtil.split(rowQty, min, max, maxSubCount));
-                    } catch (IllegalArgumentException e) {
-                        log.warn("{} 收货行数量 {} 拆单失败: {}，按单卡处理", key, rowQty, e.getMessage());
-                        cardQtys.add(rowQty);
-                    }
-                }
-            }
-
-            Map<String, Integer> inventory = new LinkedHashMap<>();
-            for (int j = 0; j < cardQtys.size(); j++) {
-                String cardNo = specModel + "-" + (j + 1);
-                inventory.put(cardNo, cardQtys.get(j));
-            }
-            inventoryByCompanySpec.put(key, inventory);
-        }
-
-        // 为每行分配 (卡号, 数量)：严格按数据表行顺序处理，从对应 (供方,规格) 的库存中扣减
         List<List<CardQty>> rowAllocations = new ArrayList<>(rows.size());
         for (int i = 0; i < rows.size(); i++) {
             rowAllocations.add(null);
         }
 
-        Map<String, Map<String, Integer>> mutableInventory = new HashMap<>();
-        for (Map.Entry<String, Map<String, Integer>> e : inventoryByCompanySpec.entrySet()) {
-            Map<String, Integer> copy = new LinkedHashMap<>();
-            for (Map.Entry<String, Integer> e2 : e.getValue().entrySet()) {
-                copy.put(e2.getKey(), e2.getValue());
-            }
-            mutableInventory.put(e.getKey(), copy);
-        }
-
-        for (int rowIndex = 0; rowIndex < rows.size(); rowIndex++) {
-            Map<String, String> row = rows.get(rowIndex);
+        for (int i = 0; i < rows.size(); i++) {
+            Map<String, String> row = rows.get(i);
             String gongFang = emptyToBlank(getColumnValue(row, "供方/发货单位", "供方／发货单位"));
+            String xuFang = emptyToBlank(getColumnValue(row, "需方/提货单位", "需方／提货单位"));
             String specModel = emptyToBlank(getColumnValue(row, "规格型号"));
             int qty = (int) Math.round(parseQuantity(row));
-            if (gongFang.isEmpty() || qty <= 0) continue;
+            if (qty <= 0) continue;
 
-            String key = gongFang + "|" + specModel;
-            Map<String, Integer> inv = mutableInventory.get(key);
-            if (inv == null) continue;
+            String gongKey = !gongFang.isEmpty() ? gongFang + "|" + specModel : null;
+            String xuKey = !xuFang.isEmpty() ? xuFang + "|" + specModel : null;
 
-            List<CardQty> allocation = allocateFromInventory(qty, inv, min, max, maxSubCount);
-            if (allocation != null) {
-                rowAllocations.set(rowIndex, allocation);
-                for (CardQty cq : allocation) {
-                    int remain = inv.getOrDefault(cq.cardNo, 0) - cq.qty;
-                    if (remain <= 0) {
-                        inv.remove(cq.cardNo);
-                    } else {
-                        inv.put(cq.cardNo, remain);
+            List<CardQty> allocForRow = null;
+
+            // 情形 1：供方有现成池（内部传递）：从供方池扣减，同时把同样的卡+数量记入需方池
+            if (gongKey != null && poolsByCompany.containsKey(gongKey)) {
+                List<CardState> fromPool = poolsByCompany.get(gongKey);
+                allocForRow = allocateFromPool(fromPool, qty);
+                if (allocForRow == null || allocForRow.isEmpty()) {
+                    log.error("[卡号分配] 发货行 行{} 供方=[{}] qty={} 从池 [{}] 分配失败（库存不足或组合失败），跳过该行分配",
+                            i + 2, gongFang, qty, gongKey);
+                    continue;
+                }
+                // 将同样的卡号和数量加入需方池，实现卡号沿链路传递
+                if (xuKey != null) {
+                    List<CardState> toPool = poolsByCompany.computeIfAbsent(xuKey, k -> new ArrayList<>());
+                    Set<Integer> usedSet = usedAmountsByCompany.computeIfAbsent(xuKey, k -> new HashSet<>());
+                    for (CardQty cq : allocForRow) {
+                        CardState target = null;
+                        for (CardState c : toPool) {
+                            if (c.cardNo.equals(cq.cardNo)) {
+                                target = c;
+                                break;
+                            }
+                        }
+                        if (target == null) {
+                            target = new CardState(cq.cardNo, 0);
+                            toPool.add(target);
+                        }
+                        target.currentTotal += cq.qty;
+                        usedSet.add(target.currentTotal);
                     }
                 }
-            } else {
-                log.warn("第 {} 行分配失败，回退到单行独立拆分", rowIndex + 2);
-                rowAllocations.set(rowIndex, null);
+                StringBuilder sb = new StringBuilder();
+                for (CardQty cq : allocForRow) sb.append(cq.cardNo).append(":").append(cq.qty).append(" ");
+                log.info("[卡号分配] 发货行 行{} 供方=[{}] 需方=[{}] 规格=[{}] qty={} -> 从池[{}] 分配并转入 [{}]: {}",
+                        i + 2, gongFang, xuFang, specModel, qty, gongKey, xuKey, sb.toString());
+            } else if (xuKey != null) {
+                // 情形 2：外部供货给某需方（或无供方信息）：为需方创建/扩展卡池
+                List<CardState> pool = poolsByCompany.computeIfAbsent(xuKey, k -> new ArrayList<>());
+                Set<Integer> usedSet = usedAmountsByCompany.computeIfAbsent(xuKey, k -> new HashSet<>());
+
+                // 将现有卡总量加入 usedSet，避免新拆出的卡总量与已有卡冲突
+                for (CardState c : pool) {
+                    usedSet.add(c.currentTotal);
+                }
+
+                allocForRow = new ArrayList<>();
+                int remainder = qty;
+
+                // 先尝试对已有未满卡续收（小卡可续收）
+                for (CardState card : pool) {
+                    if (remainder <= 0) break;
+                    if (card.currentTotal >= max) continue;
+                    int stopFillAt = Math.max(0, max - STOP_FILL_GAP);
+                    if (card.currentTotal >= stopFillAt) continue;
+                    int room = max - card.currentTotal;
+                    if (room <= 0) continue;
+                    int bestAdd = 0;
+                    for (int a = Math.min(remainder, room); a >= 1; a--) {
+                        if (usedSet.contains(a)) continue;
+                        int newTotal = card.currentTotal + a;
+                        boolean conflict = false;
+                        for (CardState other : pool) {
+                            if (other == card) continue;
+                            if (other.currentTotal == newTotal) {
+                                conflict = true;
+                                break;
+                            }
+                        }
+                        if (!conflict) {
+                            bestAdd = a;
+                            break;
+                        }
+                    }
+                    if (bestAdd <= 0) continue;
+                    usedSet.add(bestAdd);
+                    card.currentTotal += bestAdd;
+                    allocForRow.add(new CardQty(card.cardNo, bestAdd));
+                    remainder -= bestAdd;
+                }
+
+                // 剩余部分用 splitExcluding 创建新卡
+                if (remainder > 0) {
+                    List<Integer> amounts = OrderSplitUtil.splitExcluding(remainder, min, max, maxSubCount, usedSet);
+                    if (amounts == null) {
+                        amounts = new ArrayList<>();
+                        amounts.add(remainder);
+                        if (usedSet.contains(remainder)) {
+                            log.warn("第 {} 行 (需方|规格={}) 数量 {} 无法在排除已用数量下拆分，该行使用单卡并分配新卡号",
+                                    i + 2, xuKey, remainder);
+                        }
+                        usedSet.add(remainder);
+                    } else {
+                        usedSet.addAll(amounts);
+                    }
+                    int cardSeq = pool.size() + 1;
+                    for (int a : amounts) {
+                        String cardNo = specModel + "-" + cardSeq++;
+                        CardState cs = new CardState(cardNo, a);
+                        pool.add(cs);
+                        allocForRow.add(new CardQty(cardNo, a));
+                    }
+                }
+
+                // 行内合计兜底校正：保证本行分配合计严格等于原始数量
+                int allocated = 0;
+                for (CardQty cq : allocForRow) allocated += cq.qty;
+                if (allocated != qty && !allocForRow.isEmpty()) {
+                    int diff = qty - allocated;
+                    CardQty last = allocForRow.get(allocForRow.size() - 1);
+                    int newQty = last.qty + diff;
+                    if (newQty > 0) {
+                        allocForRow.set(allocForRow.size() - 1, new CardQty(last.cardNo, newQty));
+                        for (CardState card : pool) {
+                            if (card.cardNo.equals(last.cardNo)) {
+                                card.currentTotal += diff;
+                                usedSet.add(card.currentTotal);
+                                break;
+                            }
+                        }
+                        log.warn("[卡号分配] 行{} 需方|规格={} 原始数量={} 分配合计={} 存在差异，已对卡号 {} 调整 {}，修正后合计={}",
+                                i + 2, xuKey, qty, allocated, last.cardNo, diff, qty);
+                    } else {
+                        log.error("[卡号分配] 行{} 需方|规格={} 原始数量={} 分配合计={} 且无法安全调整最后一条明细，保留原分配结果，请人工检查",
+                                i + 2, xuKey, qty, allocated);
+                    }
+                }
+
+                StringBuilder sb = new StringBuilder();
+                for (CardQty cq : allocForRow) sb.append(cq.cardNo).append(":").append(cq.qty).append(" ");
+                log.info("[卡号分配] 收货行 行{} 需方|规格={} qty={} -> 本行分配: {}", i + 2, xuKey, qty, sb.toString());
             }
+
+            if (allocForRow != null && !allocForRow.isEmpty()) {
+                rowAllocations.set(i, allocForRow);
+            }
+        }
+
+        // 打印各公司卡池摘要，便于排查
+        for (Map.Entry<String, List<CardState>> e : poolsByCompany.entrySet()) {
+            String key = e.getKey();
+            List<CardState> pool = e.getValue();
+            StringBuilder poolSummary = new StringBuilder();
+            for (CardState c : pool) poolSummary.append(c.cardNo).append("=").append(c.currentTotal).append(" ");
+            log.info("[卡号分配] 最终卡池 key={} 共{}张卡: {}", key, pool.size(), poolSummary.toString());
         }
 
         return new CardAllocationContext(rowAllocations);
     }
 
     /**
-     * 从库存中分配 target 数量，返回 (卡号, 数量) 列表。
-     * 只从现有卡号库存扣减，不重新拆分，保证每个卡号「收货=发货」且总数量一致；
-     * 单张提单内同一卡号只出现一次，数量互不重复。
+     * 从供方卡池中分配出合计为 target 的 (卡号,数量)。
+     * 单提单内：每张卡最多出现一次（可部分取），优先数量互不重复；若无法凑齐则放宽为允许数量重复以保证收发对齐。
+     * 支持多笔发货：同一张卡可在不同提单中分批发出（池中扣减后剩余留给下一家）。
      */
-    private List<CardQty> allocateFromInventory(int target, Map<String, Integer> inventory,
-                                                int min, int max, int maxSubCount) {
-        if (target <= 0 || inventory.isEmpty()) return Collections.emptyList();
+    private List<CardQty> allocateFromPool(List<CardState> pool, int target) {
+        if (target <= 0 || pool.isEmpty()) return Collections.emptyList();
+        int total = 0;
+        for (CardState c : pool) total += c.currentTotal;
+        if (total < target) return null;
 
-        int totalAvail = inventory.values().stream().mapToInt(Integer::intValue).sum();
-        if (totalAvail < target) return null;
+        // 特例：本单刚好等于当前池的总量，说明这批卡会在本单中全部发完。
+        // 此时直接按卡池当前总量逐张开行，既保证每张卡“收多少发多少”，也天然满足数量互不重复（收货阶段已保证卡总量尽量唯一）。
+        if (total == target) {
+            List<CardQty> all = new ArrayList<>();
+            for (CardState c : pool) {
+                if (c.currentTotal <= 0) continue;
+                all.add(new CardQty(c.cardNo, c.currentTotal));
+                c.currentTotal = 0;
+            }
+            return all;
+        }
 
-        // 按数量从大到小排序，优先用大卡
-        List<Map.Entry<String, Integer>> cards = new ArrayList<>(inventory.entrySet());
-        cards.sort((a, b) -> Integer.compare(b.getValue(), a.getValue()));
+        // 先尝试严格模式：数量互不重复
+        List<CardQty> result = allocateFromPoolStrict(pool, target);
+        if (result != null) return result;
+
+        // 严格模式凑不齐时，用宽松模式：允许数量重复，保证池总量够时一定能凑出 target（收发对齐）
+        log.debug("[卡号分配] 严格模式无法凑齐 target={}，改用宽松模式从池分配", target);
+        return allocateFromPoolRelaxed(pool, target);
+    }
+
+    /** 严格模式：每张卡最多取一次，取的数量全局互不重复。 */
+    private List<CardQty> allocateFromPoolStrict(List<CardState> pool, int target) {
+        List<CardState> copy = new ArrayList<>();
+        for (CardState c : pool) copy.add(new CardState(c.cardNo, c.currentTotal));
 
         List<CardQty> result = new ArrayList<>();
         Set<Integer> usedAmounts = new HashSet<>();
+        Set<String> usedCardNos = new HashSet<>();
         int sum = 0;
 
-        for (Map.Entry<String, Integer> e : cards) {
-            if (sum == target) break;
-            String cardNo = e.getKey();
-            int qty = e.getValue();
+        while (sum < target) {
             int need = target - sum;
-
             if (need <= 0) break;
-
-            int takeAmt;
-            if (qty <= need) {
-                takeAmt = qty;
-            } else {
-                takeAmt = need;
-                while (usedAmounts.contains(takeAmt) && takeAmt < qty) takeAmt++;
-                if (usedAmounts.contains(takeAmt)) {
-                    takeAmt = need;
-                    while (takeAmt > 0 && usedAmounts.contains(takeAmt)) takeAmt--;
-                    if (takeAmt <= 0) continue;
-                }
-            }
-
-            result.add(new CardQty(cardNo, takeAmt));
-            usedAmounts.add(takeAmt);
-            sum += takeAmt;
-        }
-
-        if (sum != target) {
-            if (sum < target) return null;
-            int diff = sum - target;
-            for (int i = result.size() - 1; i >= 0; i--) {
-                CardQty cq = result.get(i);
-                if (cq.qty <= diff) continue;
-                int newQty = cq.qty - diff;
-                usedAmounts.remove(cq.qty);
-                if (!usedAmounts.contains(newQty)) {
-                    result.set(i, new CardQty(cq.cardNo, newQty));
-                    usedAmounts.add(newQty);
-                    sum = target;
+            int chosenAmt = 0;
+            CardState chosenCard = null;
+            for (CardState card : copy) {
+                if (card.currentTotal <= 0 || usedCardNos.contains(card.cardNo)) continue;
+                int ideal = Math.min(need, card.currentTotal);
+                if (ideal >= 1 && !usedAmounts.contains(ideal)) {
+                    chosenCard = card;
+                    chosenAmt = ideal;
                     break;
                 }
-                usedAmounts.add(cq.qty);
             }
-            if (sum != target) return null;
+            if (chosenCard == null) {
+                for (CardState card : copy) {
+                    if (card.currentTotal <= 0 || usedCardNos.contains(card.cardNo)) continue;
+                    int amt = findDistinctInRange(need, card.currentTotal, usedAmounts);
+                    if (amt >= 1 && (chosenCard == null || amt > chosenAmt)) {
+                        chosenCard = card;
+                        chosenAmt = amt;
+                    }
+                }
+            }
+            if (chosenCard == null || chosenAmt < 1) break;
+            result.add(new CardQty(chosenCard.cardNo, chosenAmt));
+            usedAmounts.add(chosenAmt);
+            usedCardNos.add(chosenCard.cardNo);
+            chosenCard.currentTotal -= chosenAmt;
+            sum += chosenAmt;
         }
 
-        return result.isEmpty() ? null : result;
+        if (sum != target) return null;
+        // 成功时回写扣减到原 pool（调用方依赖池被扣减）
+        for (CardState c : copy) {
+            for (CardState orig : pool) {
+                if (orig.cardNo.equals(c.cardNo)) {
+                    orig.currentTotal = c.currentTotal;
+                    break;
+                }
+            }
+        }
+        return result;
     }
 
-    private static class RowRef {
-        final int rowIndex;
-        final int qty;
-        final Map<String, String> rowData;
+    /** 宽松模式：每张卡最多取一次，数量可重复，保证凑齐 target。 */
+    private List<CardQty> allocateFromPoolRelaxed(List<CardState> pool, int target) {
+        List<CardQty> result = new ArrayList<>();
+        int sum = 0;
+        for (CardState card : pool) {
+            if (sum >= target) break;
+            int need = target - sum;
+            if (card.currentTotal <= 0) continue;
+            int take = Math.min(need, card.currentTotal);
+            result.add(new CardQty(card.cardNo, take));
+            card.currentTotal -= take;
+            sum += take;
+        }
+        if (sum != target) return null;
+        return result;
+    }
 
-        RowRef(int rowIndex, int qty, Map<String, String> rowData) {
-            this.rowIndex = rowIndex;
-            this.qty = qty;
-            this.rowData = rowData;
+    /** 在 [1, min(need, cap)] 内取一个不在 used 中的值，优先接近 need。 */
+    private static int findDistinctInRange(int need, int cap, Set<Integer> used) {
+        int best = Math.min(need, cap);
+        if (best < 1) return 0;
+        if (!used.contains(best)) return best;
+        for (int a = best + 1; a <= cap; a++) {
+            if (!used.contains(a)) return a;
+        }
+        for (int a = best - 1; a >= 1; a--) {
+            if (!used.contains(a)) return a;
+        }
+        return 0;
+    }
+
+    /** 卡池中一张卡的状态：卡号 + 当前总数量（可被续收直到 max） */
+    private static class CardState {
+        final String cardNo;
+        int currentTotal;
+
+        CardState(String cardNo, int currentTotal) {
+            this.cardNo = cardNo;
+            this.currentTotal = currentTotal;
         }
     }
 
@@ -329,17 +484,28 @@ public class BillOfLadingService {
         return gongInitials + "-" + xuInitials + "-" + yyyyMMdd + "-" + String.format("%03d", seq);
     }
 
-    /** 按多个可能的列名取值，兼容全角/半角斜杠等 */
+    /** 按多个可能的列名取值，兼容全角/半角斜杠，以及简写表头（如“供方”“需方”）等 */
     private String getColumnValue(Map<String, String> rowData, String... possibleKeys) {
-        for (String key : possibleKeys) {
+        // 扩展候选列名：在原始 possibleKeys 基础上，为“供方/发货单位”增加“供方”，为“需方/提货单位”增加“需方”
+        List<String> candidates = new ArrayList<>();
+        for (String pk : possibleKeys) {
+            if (pk == null) continue;
+            candidates.add(pk);
+            if (pk.contains("供方")) candidates.add("供方");
+            if (pk.contains("需方")) candidates.add("需方");
+        }
+        // 先按精确列名匹配
+        for (String key : candidates) {
             String v = rowData.get(key);
             if (v != null && !v.trim().isEmpty()) return v;
         }
+        // 再按“归一化后的列名”模糊匹配（兼容全角/半角等差异）
         for (Map.Entry<String, String> e : rowData.entrySet()) {
             String k = e.getKey();
             if (k == null) continue;
-            for (String pk : possibleKeys) {
-                if (normalizeKey(k).equals(normalizeKey(pk))) return e.getValue();
+            String normK = normalizeKey(k);
+            for (String pk : candidates) {
+                if (normalizeKey(pk).equals(normK)) return e.getValue();
             }
         }
         return rowData.get(possibleKeys[0]);
@@ -433,29 +599,31 @@ public class BillOfLadingService {
         return isXlsx ? new XSSFWorkbook(pis) : new HSSFWorkbook(pis);
     }
 
-    private List<Map<String, String>> readDataSheet(Path dataFile) throws IOException {
+    private List<Map<String, String>> readDataSheet(Sheet sheet) {
         List<Map<String, String>> rows = new ArrayList<>();
-        try (InputStream is = Files.newInputStream(dataFile);
-             Workbook workbook = openWorkbook(is, dataFile)) {
-            Sheet sheet = workbook.getSheetAt(0);
-            if (sheet == null || sheet.getPhysicalNumberOfRows() < 2) return rows;
-            Row headerRow = sheet.getRow(0);
-            List<String> headers = new ArrayList<>();
-            for (Cell cell : headerRow) {
-                headers.add(getCellStringValue(cell, null));
+        if (sheet == null || sheet.getPhysicalNumberOfRows() < 2) return rows;
+        Row headerRow = sheet.getRow(0);
+        if (headerRow == null) return rows;
+        List<String> headers = new ArrayList<>();
+        for (Cell cell : headerRow) {
+            headers.add(getCellStringValue(cell, null));
+        }
+        for (int r = 1; r <= sheet.getLastRowNum(); r++) {
+            Row row = sheet.getRow(r);
+            if (row == null) continue;
+            Map<String, String> rowData = new LinkedHashMap<>();
+            for (int c = 0; c < headers.size(); c++) {
+                String header = headers.get(c);
+                if (header == null || header.trim().isEmpty()) header = "col" + c;
+                Cell cell = row.getCell(c);
+                rowData.put(header.trim(), cell != null ? getCellStringValue(cell, header) : "");
             }
-            for (int r = 1; r <= sheet.getLastRowNum(); r++) {
-                Row row = sheet.getRow(r);
-                if (row == null) continue;
-                Map<String, String> rowData = new LinkedHashMap<>();
-                for (int c = 0; c < headers.size(); c++) {
-                    String header = headers.get(c);
-                    if (header == null || header.trim().isEmpty()) header = "col" + c;
-                    Cell cell = row.getCell(c);
-                    rowData.put(header.trim(), cell != null ? getCellStringValue(cell, header) : "");
-                }
-                rows.add(rowData);
-            }
+            // 跳过空行：供方和需方都为空，或数量不大于 0 的行不参与提单生成，避免生成大量空表
+            String gongFang = emptyToBlank(getColumnValue(rowData, "供方/发货单位", "供方／发货单位"));
+            String xuFang = emptyToBlank(getColumnValue(rowData, "需方/提货单位", "需方／提货单位"));
+            double qty = parseQuantity(rowData);
+            if ((gongFang.isEmpty() && xuFang.isEmpty()) || qty <= 0) continue;
+            rows.add(rowData);
         }
         return rows;
     }

@@ -4,16 +4,16 @@ spring:
 
 # 合同批量生成配置，可通过 java -jar xxx.jar --contract.data-path=xxx 覆盖
 contract:
-  data-path: D:\test\batch\0310.xlsx
-  template-path: D:/test/batch/Contract_Template.xlsx
-  output-dir: D:/test/batch/output_contract
+  data-path: C:\Users\Skye ding\Desktop\batch\batch\数据模板.xlsx
+  template-path: C:\Users\Skye ding\Desktop\batch\batch\Contract_Template.xlsx
+  output-dir: C:\Users\Skye ding\Desktop\batch\batch\output_contract
   output-file-name-pattern: "合同-${供方简称}-${需方简称}-${合同编号}.xls"
 
 # 提单批量生成配置
 bill-of-lading:
-  data-path: D:/test/batch/0310-2.xlsx
-  template-path: D:/test/batch/bill-of-lading.xlsx
-  output-dir: D:/test/batch/output_bill
+  data-path: C:\Users\Skye ding\Desktop\batch\batch\数据模板.xlsx
+  template-path: C:\Users\Skye ding\Desktop\batch\batch\bill-of-lading.xlsx
+  output-dir: C:\Users\Skye ding\Desktop\batch\batch\output_bill
   output-file-name-pattern: "提单-${供方简称}-${需方简称}-${提单编号}.xls"
   # 拆单配置
   split-min: 50
