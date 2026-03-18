@@ -22,7 +22,8 @@ bill-of-lading:
 
 # 资金流批量生成配置
 fund-flow:
-  data-path: D:/test/batch/资金流数据.xlsx
-  template-path: D:/test/batch/资金流模板.xlsx
-  output-dir: D:/test/batch/output_fund
-  output-file-name-pattern: "资金流-${合同编号}.xls"
+  data-path: D:\test\batch\数据模板.xlsx
+  output-dir: D:\test\batch\output_fund
+  output-file-name: 资金流.xlsx
+  # 金额列名（默认用价税合计金额；也可改为 不含税金额 / 结算金额 等）
+  amount-column: 价税合计金额

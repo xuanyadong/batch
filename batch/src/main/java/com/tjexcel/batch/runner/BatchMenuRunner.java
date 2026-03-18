@@ -1,6 +1,7 @@
 package com.tjexcel.batch.runner;
 
 import com.tjexcel.batch.config.ContractConfig;
+import com.tjexcel.batch.service.FundFlowService;
 import com.tjexcel.batch.service.BillOfLadingService;
 import com.tjexcel.batch.service.ContractGeneratorService;
 import com.tjexcel.batch.util.ExcelInspector;
@@ -28,13 +29,16 @@ public class BatchMenuRunner implements CommandLineRunner {
 
     private final ContractGeneratorService contractGeneratorService;
     private final BillOfLadingService billOfLadingService;
+    private final FundFlowService fundFlowService;
     private final ContractConfig contractConfig;
 
     public BatchMenuRunner(ContractGeneratorService contractGeneratorService,
                           BillOfLadingService billOfLadingService,
+                          FundFlowService fundFlowService,
                           ContractConfig contractConfig) {
         this.contractGeneratorService = contractGeneratorService;
         this.billOfLadingService = billOfLadingService;
+        this.fundFlowService = fundFlowService;
         this.contractConfig = contractConfig;
     }
 
@@ -71,9 +75,7 @@ public class BatchMenuRunner implements CommandLineRunner {
                 runBillOfLading();
                 break;
             case "3":
-                log.info("资金流功能待实现");
-                System.out.println("资金流功能待实现");
-                System.exit(0);
+                runFundFlow();
                 break;
             case "0":
                 log.info("用户选择退出");
@@ -106,6 +108,18 @@ public class BatchMenuRunner implements CommandLineRunner {
             System.exit(0);
         } catch (Exception e) {
             log.error("提单批量生成失败", e);
+            System.exit(1);
+        }
+    }
+
+    private void runFundFlow() {
+        log.info("开始执行资金流生成...");
+        try {
+            int count = fundFlowService.generate();
+            log.info("资金流生成完成，共生成 {} 个文件", count);
+            System.exit(0);
+        } catch (Exception e) {
+            log.error("资金流生成失败", e);
             System.exit(1);
         }
     }
