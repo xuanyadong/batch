@@ -27,3 +27,10 @@ fund-flow:
   output-file-name: 资金流.xlsx
   # 金额列名（默认用价税合计金额；也可改为 不含税金额 / 结算金额 等）
   amount-column: 价税合计金额
+  # 资金流起点公司全称列表（逗号分隔或 YAML 列表），按顺序逐个展开
+  # 例：root-companies: 公司A,公司B
+  # 或：
+  # root-companies:
+  #   - 公司A全称
+  #   - 公司B全称
+  root-companies: 厦门伊科东城塑料制品销售有限公司

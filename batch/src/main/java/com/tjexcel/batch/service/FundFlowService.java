@@ -8,23 +8,19 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
-import java.io.FileNotFoundException;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
+import java.io.*;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
+import java.nio.file.*;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 
 /**
- * 资金流生成（无模板）：每个数据 sheet 输出 1 个资金流表（一个输出文件内多 Sheet）
- * 方向：需方(付款方) -> 供方(收款方)
- * 金额：默认取配置 amountColumn（一般为 价税合计金额）
+ * 资金流生成服务。
+ *
+ * 方向：需方（付款方）-> 供方（收款方），金额取"价税合计金额"列。
+ * 按 README 规则 1-10 生成资金流表格。
  */
 @Service
 public class FundFlowService {
@@ -37,6 +33,10 @@ public class FundFlowService {
         this.config = config;
     }
 
+    // =========================================================================
+    // 入口
+    // =========================================================================
+
     public int generate() throws IOException {
         Path dataFile = Paths.get(config.getDataPath()).toAbsolutePath();
         Path outputDir = Paths.get(config.getOutputDir()).toAbsolutePath();
@@ -46,236 +46,330 @@ public class FundFlowService {
             throw new FileNotFoundException("数据表不存在: " + dataFile);
         }
 
-        int sheetSuccessCount = 0;
+        int count = 0;
         try (InputStream is = Files.newInputStream(dataFile);
              Workbook dataWb = openWorkbook(is, dataFile)) {
 
-            for (int sheetIndex = 0; sheetIndex < dataWb.getNumberOfSheets(); sheetIndex++) {
-                Sheet sheet = dataWb.getSheetAt(sheetIndex);
+            for (int si = 0; si < dataWb.getNumberOfSheets(); si++) {
+                Sheet sheet = dataWb.getSheetAt(si);
                 if (sheet == null) continue;
 
-                List<RowItem> items = readFundFlowItems(sheet);
-                if (items.isEmpty()) {
+                List<Edge> edges = readEdges(sheet);
+                if (edges.isEmpty()) {
                     log.warn("Sheet [{}] 无有效资金流数据，跳过", sheet.getSheetName());
                     continue;
                 }
 
-                String outName = buildOutputFileName(sheet.getSheetName());
+                List<String> roots = resolveRoots(edges);
+                if (roots.isEmpty()) {
+                    log.warn("Sheet [{}] 未找到起点，跳过", sheet.getSheetName());
+                    continue;
+                }
+
+                String outName = "资金流-" + sanitizeFileName(sheet.getSheetName()) + ".xlsx";
                 Path outFile = outputDir.resolve(outName);
 
-                try (Workbook outWb = new XSSFWorkbook()) {
-                    String outSheetName = sanitizeSheetName(sheet.getSheetName());
-                    if (outSheetName.isEmpty()) outSheetName = "资金流";
-                    Sheet outSheet = outWb.createSheet(outSheetName);
-                    writeFundFlowSheet(outWb, outSheet, items);
-
-                    if (outWb instanceof XSSFWorkbook) {
-                        ((XSSFWorkbook) outWb).setForceFormulaRecalculation(true);
-                    } else if (outWb instanceof HSSFWorkbook) {
-                        ((HSSFWorkbook) outWb).setForceFormulaRecalculation(true);
-                    }
-
+                try (XSSFWorkbook outWb = new XSSFWorkbook()) {
+                    String sheetName = sanitizeSheetName(sheet.getSheetName());
+                    if (sheetName.isEmpty()) sheetName = "资金流";
+                    Sheet outSheet = outWb.createSheet(sheetName);
+                    writeSheet(outWb, outSheet, edges, roots);
+                    outWb.setForceFormulaRecalculation(true);
                     try (OutputStream os = Files.newOutputStream(outFile)) {
                         outWb.write(os);
                     }
                 }
 
-                log.info("Sheet [{}] 已生成资金流文件: {} ({} 条明细)", sheet.getSheetName(), outFile.getFileName(), items.size());
-                sheetSuccessCount++;
+                log.info("Sheet [{}] -> {} ({} 条明细)", sheet.getSheetName(), outFile.getFileName(), edges.size());
+                count++;
             }
         }
 
-        log.info("资金流生成完成，共生成 {} 个Sheet，输出目录: {}", sheetSuccessCount, outputDir);
-        return sheetSuccessCount;
+        log.info("资金流生成完成，共 {} 个文件，输出目录: {}", count, outputDir);
+        return count;
     }
 
-    private String buildOutputFileName(String sheetName) {
-        String safe = sanitizeFileName(sheetName);
-        if (safe.isEmpty()) safe = "sheet";
-        return "资金流-" + safe + ".xlsx";
+    // =========================================================================
+    // 数据模型
+    // =========================================================================
+
+    /** 一条有向交易记录（有向边）。rowNo 为数据表原始行号（1-based），用于排序和唯一性。 */
+    private static class Edge {
+        final String payer;       // 需方（付款方）
+        final String payee;       // 供方（收款方）
+        final BigDecimal amount;
+        final int rowNo;
+
+        Edge(String payer, String payee, BigDecimal amount, int rowNo) {
+            this.payer = payer;
+            this.payee = payee;
+            this.amount = amount;
+            this.rowNo = rowNo;
+        }
+    }
+
+    // =========================================================================
+    // Excel 写入
+    // =========================================================================
+
+    private void writeSheet(Workbook wb, Sheet out, List<Edge> allEdges, List<String> roots) {
+        CellStyle nameStyle = createNameStyle(wb);
+        CellStyle amtStyle  = createAmountStyle(wb);
+
+        // 建图：需方 -> 出边列表，按 rowNo 升序（规则 5.1）
+        Map<String, List<Edge>> graph = new LinkedHashMap<>();
+        for (Edge e : allEdges) {
+            graph.computeIfAbsent(e.payer, k -> new ArrayList<>()).add(e);
+        }
+        graph.values().forEach(list -> list.sort(Comparator.comparingInt(e -> e.rowNo)));
+        // 入边：供方 -> 入边列表，按 rowNo 升序（规则 5.2）
+        Map<String, List<Edge>> incoming = new LinkedHashMap<>();
+        for (Edge e : allEdges) {
+            incoming.computeIfAbsent(e.payee, k -> new ArrayList<>()).add(e);
+        }
+        incoming.values().forEach(list -> list.sort(Comparator.comparingInt(e -> e.rowNo)));
+
+        Set<Integer> usedRows = new LinkedHashSet<>(); // 规则 7.1：每条交易只出现一次
+
+        int rowCursor = 0;
+        int maxCol    = 0;
+        int[] maxColRef = {0};
+
+        // 1) 先按配置起点生成链
+        for (String root : roots) {
+            rowCursor = writeChain(out, root, graph, new LinkedHashSet<>(),
+                    0, rowCursor, nameStyle, amtStyle, maxColRef, usedRows, incoming);
+            maxCol = Math.max(maxCol, maxColRef[0]);
+            rowCursor++; // 规则 10：链间空行
+        }
+
+        // 2) 对未使用的交易补链：按原始行号升序，每条以付款方为起点独立成链
+        List<Edge> remaining = new ArrayList<>();
+        for (Edge e : allEdges) {
+            if (!usedRows.contains(e.rowNo)) remaining.add(e);
+        }
+        remaining.sort(Comparator.comparingInt(e -> e.rowNo));
+        for (Edge e : remaining) {
+            rowCursor = writeChain(out, e.payer, graph, new LinkedHashSet<>(),
+                    0, rowCursor, nameStyle, amtStyle, maxColRef, usedRows, incoming);
+            maxCol = Math.max(maxCol, maxColRef[0]);
+            rowCursor++; // 链间空行
+        }
+
+        for (int c = 0; c <= maxCol; c++) {
+            out.autoSizeColumn(c);
+            int w = out.getColumnWidth(c);
+            int adjusted = (int) Math.min((long) w * 3L / 2L, 255L * 256L);
+            out.setColumnWidth(c, Math.max(20 * 256, adjusted));
+        }
     }
 
     /**
-     * 横向资金流：一层一列，付款方在左；同层多公司同一列，纵向对齐（客户与公司、公司与上游对齐）。
-     * 表头每列只写一次；列内按笔数显示（对方名+金额），几笔几行。
+     * 递归写链：返回写完后的下一可用行。
+     *
+     * 规则要点：
+     * - 每笔交易占两行：名称行 + 金额行（金额写在付款方列）
+     * - 分叉在付款方列下方展开（规则 9）
+     * - 叶节点只写名称行
      */
-    private void writeFundFlowSheet(Workbook wb, Sheet out, List<RowItem> items) {
-        DataFormat df = wb.createDataFormat();
-        CellStyle nameStyle = wb.createCellStyle();
-        nameStyle.setAlignment(HorizontalAlignment.LEFT);
-        nameStyle.setVerticalAlignment(VerticalAlignment.CENTER);
-        CellStyle amountStyle = wb.createCellStyle();
-        amountStyle.setDataFormat(df.getFormat("#,##0.00"));
-        amountStyle.setAlignment(HorizontalAlignment.LEFT);
-        amountStyle.setVerticalAlignment(VerticalAlignment.CENTER);
+    private int writeChain(Sheet out,
+                           String company,
+                           Map<String, List<Edge>> graph,
+                           LinkedHashSet<String> path,
+                           int col,
+                           int rowStart,
+                           CellStyle nameStyle,
+                           CellStyle amtStyle,
+                           int[] maxCol,
+                           Set<Integer> usedRows,
+                           Map<String, List<Edge>> incoming) {
+        maxCol[0] = Math.max(maxCol[0], col);
 
-        // 1. 建图：保持输入顺序
-        Map<String, List<RowItem>> outEdges = new LinkedHashMap<>();
-        LinkedHashSet<String> payerOrder = new LinkedHashSet<>();
-        Set<String> incoming = new HashSet<>();
-        for (RowItem it : items) {
-            payerOrder.add(it.payer);
-            incoming.add(it.payee);
-            outEdges.computeIfAbsent(it.payer, k -> new ArrayList<>()).add(it);
+        List<Edge> edges = graph.getOrDefault(company, Collections.emptyList());
+        boolean hasUnused = false;
+        for (Edge e : edges) {
+            if (!usedRows.contains(e.rowNo)) {
+                hasUnused = true;
+                break;
+            }
         }
 
-        // 2. 根节点：入度为 0 的付款方（保持出现顺序）
-        List<String> roots = new ArrayList<>();
-        for (String payer : payerOrder) {
-            if (!incoming.contains(payer)) roots.add(payer);
-        }
-        if (roots.isEmpty() && !payerOrder.isEmpty()) {
-            roots.add(payerOrder.iterator().next());
+        // 叶节点或闭环：只写公司名
+        if (path.contains(company) || !hasUnused) {
+            writeNameCell(out, col, rowStart, company, nameStyle);
+            return rowStart + 1;
         }
 
-        // 3. 构建树并写表：父节点显示一次，子节点多笔在其下方展开
-        int[] maxDepth = new int[] {0};
-        int rowPairCursor = 0;
-        for (String root : roots) {
-            FlowNode node = buildFlowNode(root, null, outEdges, new LinkedHashSet<>());
-            rowPairCursor = writeFlowNode(out, node, nameStyle, amountStyle, 0, rowPairCursor, maxDepth);
-        }
-
-        int numCols = maxDepth[0] + 1;
-        for (int c = 0; c < numCols; c++) {
-            out.autoSizeColumn(c);
-            int w = out.getColumnWidth(c);
-            int doubled = (int) Math.min((long) w * 2L, 255L * 256L);
-            out.setColumnWidth(c, Math.max(20 * 256, doubled));
-        }
-    }
-
-    private static class FlowNode {
-        final String company;
-        final BigDecimal amount;
-        final List<FlowNode> children = new ArrayList<>();
-
-        FlowNode(String company, BigDecimal amount) {
-            this.company = company;
-            this.amount = amount;
-        }
-    }
-
-    private FlowNode buildFlowNode(String company,
-                                   BigDecimal amount,
-                                   Map<String, List<RowItem>> outEdges,
-                                   LinkedHashSet<String> path) {
-        FlowNode node = new FlowNode(company, amount);
-        if (path.contains(company)) {
-            return node;
-        }
         LinkedHashSet<String> nextPath = new LinkedHashSet<>(path);
         nextPath.add(company);
-        List<RowItem> outs = outEdges.getOrDefault(company, Collections.emptyList());
-        for (RowItem it : outs) {
-            node.children.add(buildFlowNode(it.payee, it.amount, outEdges, nextPath));
+
+        // 链首优先写一行公司名，防止链首缺失
+        writeNameCell(out, col, rowStart, company, nameStyle);
+
+        int rowCursor = rowStart;
+        for (Edge edge : edges) {
+            if (usedRows.contains(edge.rowNo)) continue;
+            if (!isIncomingOrderOk(edge, usedRows, incoming)) continue;
+            usedRows.add(edge.rowNo);
+
+            int nameRow = rowCursor;
+            int amtRow  = rowCursor + 1;
+
+            // 付款方公司名（每笔交易一行都写，避免出现“只有金额没有公司名”）
+            writeNameCell(out, col, nameRow, company, nameStyle);
+            // 金额（写在付款方列）
+            writeAmountCell(out, col, amtRow, edge.amount, amtStyle);
+
+            // 收款方在右侧继续展开
+            int childEnd = writeChain(out, edge.payee, graph, nextPath,
+                    col + 1, nameRow, nameStyle, amtStyle, maxCol, usedRows, incoming);
+
+            rowCursor = Math.max(amtRow + 1, childEnd);
         }
-        return node;
+
+        return rowCursor;
     }
 
-    private int writeFlowNode(Sheet out,
-                              FlowNode node,
-                              CellStyle nameStyle,
-                              CellStyle amountStyle,
-                              int depth,
-                              int startRowPair,
-                              int[] maxDepth) {
-        maxDepth[0] = Math.max(maxDepth[0], depth);
-        writeCell(out, depth, startRowPair, node.company, node.amount, nameStyle, amountStyle);
-        int row = startRowPair;
-        if (node.children.isEmpty()) {
-            return startRowPair + 1;
+    /**
+     * 规则 5.2：同一供方的入边按行号升序优先展示。
+     * 若当前入边前面还有未使用的更小行号入边，则先跳过当前入边。
+     */
+    private boolean isIncomingOrderOk(Edge edge,
+                                      Set<Integer> usedRows,
+                                      Map<String, List<Edge>> incoming) {
+        List<Edge> inList = incoming.get(edge.payee);
+        if (inList == null || inList.isEmpty()) return true;
+        for (Edge e : inList) {
+            if (e.rowNo >= edge.rowNo) break;
+            if (!usedRows.contains(e.rowNo)) return false;
         }
-        for (FlowNode ch : node.children) {
-            row = writeFlowNode(out, ch, nameStyle, amountStyle, depth + 1, row, maxDepth);
-        }
-        return row;
+        return true;
     }
 
-    private void writeCell(Sheet out,
-                           int col,
-                           int rowPair,
-                           String name,
-                           BigDecimal amount,
-                           CellStyle nameStyle,
-                           CellStyle amountStyle) {
-        int rowName = rowPair * 2;
-        int rowAmt = rowName + 1;
-        Row nameRow = out.getRow(rowName);
-        if (nameRow == null) nameRow = out.createRow(rowName);
-        Row amountRow = out.getRow(rowAmt);
-        if (amountRow == null) amountRow = out.createRow(rowAmt);
+    // =========================================================================
+    // 单元格写入
+    // =========================================================================
 
-        Cell cn = nameRow.getCell(col);
-        if (cn == null) cn = nameRow.createCell(col);
-        cn.setCellStyle(nameStyle);
-        cn.setCellValue(name == null ? "" : name);
-
-        if (amount != null) {
-            Cell ca = amountRow.getCell(col);
-            if (ca == null) ca = amountRow.createCell(col);
-            ca.setCellStyle(amountStyle);
-            ca.setCellValue(amount.doubleValue());
-        }
+    private void writeNameCell(Sheet out, int col, int row, String name, CellStyle style) {
+        Row r = out.getRow(row);
+        if (r == null) r = out.createRow(row);
+        Cell c = r.getCell(col);
+        if (c == null) c = r.createCell(col);
+        c.setCellStyle(style);
+        c.setCellValue(name == null ? "" : name);
     }
 
-    private List<RowItem> readFundFlowItems(Sheet sheet) {
-        List<RowItem> items = new ArrayList<>();
-        if (sheet.getPhysicalNumberOfRows() < 2) return items;
+    private void writeAmountCell(Sheet out, int col, int row, BigDecimal amount, CellStyle style) {
+        if (amount == null) return;
+        Row r = out.getRow(row);
+        if (r == null) r = out.createRow(row);
+        Cell c = r.getCell(col);
+        if (c == null) c = r.createCell(col);
+        c.setCellStyle(style);
+        c.setCellValue(amount.doubleValue());
+    }
+
+    private CellStyle createNameStyle(Workbook wb) {
+        CellStyle s = wb.createCellStyle();
+        s.setAlignment(HorizontalAlignment.LEFT);
+        s.setVerticalAlignment(VerticalAlignment.CENTER);
+        return s;
+    }
+
+    private CellStyle createAmountStyle(Workbook wb) {
+        CellStyle s = wb.createCellStyle();
+        s.setDataFormat(wb.createDataFormat().getFormat("#,##0.00"));
+        s.setAlignment(HorizontalAlignment.LEFT);
+        s.setVerticalAlignment(VerticalAlignment.CENTER);
+        return s;
+    }
+
+    // =========================================================================
+    // 数据读取
+    // =========================================================================
+
+    private List<Edge> readEdges(Sheet sheet) {
+        List<Edge> edges = new ArrayList<>();
+        if (sheet.getPhysicalNumberOfRows() < 2) return edges;
 
         Row headerRow = sheet.getRow(0);
-        if (headerRow == null) return items;
+        if (headerRow == null) return edges;
 
         List<String> headers = new ArrayList<>();
         for (Cell cell : headerRow) {
             headers.add(getCellStringValue(cell, null));
         }
 
-        int payerIdx = findHeaderIndex(headers, Arrays.asList("需方", "买方", "需方/提货单位", "需方／提货单位"));
-        int payeeIdx = findHeaderIndex(headers, Arrays.asList("供方", "卖方", "供方/发货单位", "供方／发货单位"));
+        int payerIdx  = findHeaderIndex(headers, Arrays.asList("需方", "买方", "需方/提货单位", "需方／提货单位"));
+        int payeeIdx  = findHeaderIndex(headers, Arrays.asList("供方", "卖方", "供方/发货单位", "供方／发货单位"));
         int amountIdx = findHeaderIndex(headers, Collections.singletonList(config.getAmountColumn()));
-
-        // 兜底：找不到金额列时，尝试常见列名
         if (amountIdx < 0) {
             amountIdx = findHeaderIndex(headers, Arrays.asList("价税合计金额", "不含税金额", "结算金额"));
+        }
+
+        if (payerIdx < 0 || payeeIdx < 0 || amountIdx < 0) {
+            log.warn("找不到必要列（需方/供方/金额），headers={}", headers);
+            return edges;
         }
 
         for (int r = 1; r <= sheet.getLastRowNum(); r++) {
             Row row = sheet.getRow(r);
             if (row == null) continue;
 
-            String payer = getCellStringValue(row.getCell(payerIdx), "需方").trim();
-            String payee = getCellStringValue(row.getCell(payeeIdx), "供方").trim();
-            String amountStr = getCellStringValue(row.getCell(amountIdx), config.getAmountColumn()).trim();
+            String payer  = getCellStringValue(row.getCell(payerIdx),  "需方").trim();
+            String payee  = getCellStringValue(row.getCell(payeeIdx),  "供方").trim();
+            String amtStr = getCellStringValue(row.getCell(amountIdx), config.getAmountColumn()).trim();
 
             if (payer.isEmpty() || payee.isEmpty()) continue;
-            BigDecimal amount = parseAmount(amountStr);
+            BigDecimal amount = parseAmount(amtStr);
             if (amount == null || amount.compareTo(BigDecimal.ZERO) <= 0) continue;
 
-            items.add(new RowItem(payer, payee, amount, r + 1));
+            edges.add(new Edge(payer, payee, amount, r + 1));
         }
-        return items;
+        return edges;
+    }
+
+    // =========================================================================
+    // 辅助方法
+    // =========================================================================
+
+    /** 解析起点：优先用配置，配置为空则回退到入度为 0 的付款方。 */
+    private List<String> resolveRoots(List<Edge> edges) {
+        List<String> configured = config.getRootCompanies();
+        if (configured != null) {
+            List<String> valid = new ArrayList<>();
+            for (String s : configured) {
+                if (s != null && !s.trim().isEmpty()) valid.add(s.trim());
+            }
+            if (!valid.isEmpty()) return valid;
+        }
+
+        Set<String> payees = new HashSet<>();
+        for (Edge e : edges) payees.add(e.payee);
+
+        List<String> roots = new ArrayList<>();
+        LinkedHashSet<String> seen = new LinkedHashSet<>();
+        for (Edge e : edges) {
+            if (seen.add(e.payer) && !payees.contains(e.payer)) roots.add(e.payer);
+        }
+        if (roots.isEmpty() && !seen.isEmpty()) roots.add(seen.iterator().next());
+        return roots;
     }
 
     private static int findHeaderIndex(List<String> headers, List<String> candidates) {
-        if (headers == null) return -1;
         for (int i = 0; i < headers.size(); i++) {
             String h = headers.get(i) == null ? "" : headers.get(i).trim();
             for (String c : candidates) {
-                if (c != null && !c.trim().isEmpty() && h.equals(c.trim())) {
-                    return i;
-                }
+                if (c != null && !c.trim().isEmpty() && h.equals(c.trim())) return i;
             }
         }
         return -1;
     }
 
     private static BigDecimal parseAmount(String s) {
-        if (s == null) return null;
-        String t = s.trim().replace(",", "");
-        if (t.isEmpty()) return null;
+        if (s == null || s.trim().isEmpty()) return null;
         try {
-            return new BigDecimal(t).setScale(2, RoundingMode.HALF_UP);
+            return new BigDecimal(s.trim().replace(",", "")).setScale(2, RoundingMode.HALF_UP);
         } catch (Exception ignored) {
             return null;
         }
@@ -283,8 +377,7 @@ public class FundFlowService {
 
     private static Workbook openWorkbook(InputStream is, Path file) throws IOException {
         String name = file.getFileName().toString().toLowerCase();
-        if (name.endsWith(".xlsx")) return new XSSFWorkbook(is);
-        return new HSSFWorkbook(is);
+        return name.endsWith(".xlsx") ? new XSSFWorkbook(is) : new HSSFWorkbook(is);
     }
 
     private static String sanitizeFileName(String name) {
@@ -294,11 +387,10 @@ public class FundFlowService {
 
     private static String sanitizeSheetName(String name) {
         String safe = sanitizeFileName(name);
-        if (safe.length() > 31) safe = safe.substring(0, 31);
-        return safe;
+        return safe.length() > 31 ? safe.substring(0, 31) : safe;
     }
 
-    private static final DateTimeFormatter DATE_DISPLAY_FMT = DateTimeFormatter.ofPattern("yyyy/M/d");
+    private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("yyyy/M/d");
 
     private String getCellStringValue(Cell cell, String columnHeader) {
         if (cell == null) return "";
@@ -307,12 +399,8 @@ public class FundFlowService {
                 return cell.getStringCellValue();
             case NUMERIC:
                 if (DateUtil.isCellDateFormatted(cell)) {
-                    try {
-                        LocalDate d = cell.getLocalDateTimeCellValue().toLocalDate();
-                        return d.format(DATE_DISPLAY_FMT);
-                    } catch (Exception ignored) {
-                        return "";
-                    }
+                    try { return cell.getLocalDateTimeCellValue().toLocalDate().format(DATE_FMT); }
+                    catch (Exception ignored) { return ""; }
                 }
                 return formatNumeric(cell.getNumericCellValue(), isAmountColumn(columnHeader) ? 2 : -1);
             case BOOLEAN:
@@ -320,16 +408,12 @@ public class FundFlowService {
             case FORMULA:
                 try {
                     if (DateUtil.isCellDateFormatted(cell)) {
-                        LocalDate d = cell.getLocalDateTimeCellValue().toLocalDate();
-                        return d.format(DATE_DISPLAY_FMT);
+                        return cell.getLocalDateTimeCellValue().toLocalDate().format(DATE_FMT);
                     }
                     return formatNumeric(cell.getNumericCellValue(), isAmountColumn(columnHeader) ? 2 : -1);
                 } catch (Exception e) {
-                    try {
-                        return cell.getStringCellValue();
-                    } catch (Exception ignored) {
-                        return cell.getCellFormula();
-                    }
+                    try { return cell.getStringCellValue(); }
+                    catch (Exception ignored) { return cell.getCellFormula(); }
                 }
             default:
                 return "";
@@ -339,7 +423,8 @@ public class FundFlowService {
     private boolean isAmountColumn(String header) {
         if (header == null) return false;
         String h = header.trim();
-        return h.equals("价税合计金额") || h.equals("不含税金额") || h.equals("增值税额") || h.equals(config.getAmountColumn());
+        return h.equals("价税合计金额") || h.equals("不含税金额") || h.equals("增值税额")
+                || h.equals(config.getAmountColumn());
     }
 
     private static String formatNumeric(double num, int decimals) {
@@ -348,25 +433,7 @@ public class FundFlowService {
             return String.valueOf((long) num);
         }
         int scale = decimals >= 0 ? decimals : 6;
-        BigDecimal bd = BigDecimal.valueOf(num).setScale(scale, RoundingMode.HALF_UP);
-        return bd.stripTrailingZeros().toPlainString();
+        return BigDecimal.valueOf(num).setScale(scale, RoundingMode.HALF_UP)
+                         .stripTrailingZeros().toPlainString();
     }
-
-    private static class RowItem {
-        final String payer;
-        final String payee;
-        final BigDecimal amount;
-        final int sourceRowNo;
-
-        RowItem(String payer, String payee, BigDecimal amount, int sourceRowNo) {
-            this.payer = payer;
-            this.payee = payee;
-            this.amount = amount;
-            this.sourceRowNo = sourceRowNo;
-        }
-    }
-
-    // PairKey/Summary 已不再使用（旧版“明细+汇总”布局）
 }
-
-
