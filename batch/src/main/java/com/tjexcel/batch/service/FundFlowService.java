@@ -60,20 +60,14 @@ public class FundFlowService {
                     continue;
                 }
 
-                List<String> roots = resolveRoots(edges);
-                if (roots.isEmpty()) {
-                    log.warn("Sheet [{}] 未找到起点，跳过", sheet.getSheetName());
-                    continue;
-                }
-
-                String outName = "资金流-" + sanitizeFileName(sheet.getSheetName()) + ".xlsx";
+                String outName = "资金流_" + sanitizeFileName(sheet.getSheetName()) + ".xlsx";
                 Path outFile = outputDir.resolve(outName);
 
                 try (XSSFWorkbook outWb = new XSSFWorkbook()) {
                     String sheetName = sanitizeSheetName(sheet.getSheetName());
                     if (sheetName.isEmpty()) sheetName = "资金流";
                     Sheet outSheet = outWb.createSheet(sheetName);
-                    writeSheet(outWb, outSheet, edges, roots);
+                    writeSheet(outWb, outSheet, edges);
                     outWb.setForceFormulaRecalculation(true);
                     try (OutputStream os = Files.newOutputStream(outFile)) {
                         outWb.write(os);
@@ -93,7 +87,7 @@ public class FundFlowService {
     // 数据模型
     // =========================================================================
 
-    /** 一条有向交易记录（有向边）。rowNo 为数据表原始行号（1-based），用于排序和唯一性。 */
+    /** 一条有向交易记录（有向边）。rowNo 为数据表原始行号（1-based），用于排序和唯一性。*/
     private static class Edge {
         final String payer;       // 需方（付款方）
         final String payee;       // 供方（收款方）
@@ -108,52 +102,39 @@ public class FundFlowService {
         }
     }
 
+    private static class Chain {
+        final List<Edge> edges = new ArrayList<>();
+    }
+
+    private static class ChainWriteResult {
+        final int cols;  // 使用的列数
+        final int rows;  // 使用的行数
+        
+        ChainWriteResult(int cols, int rows) {
+            this.cols = cols;
+            this.rows = rows;
+        }
+    }
+
     // =========================================================================
     // Excel 写入
     // =========================================================================
 
-    private void writeSheet(Workbook wb, Sheet out, List<Edge> allEdges, List<String> roots) {
+    private void writeSheet(Workbook wb, Sheet out, List<Edge> allEdges) {
         CellStyle nameStyle = createNameStyle(wb);
         CellStyle amtStyle  = createAmountStyle(wb);
 
-        // 建图：需方 -> 出边列表，按 rowNo 升序（规则 5.1）
-        Map<String, List<Edge>> graph = new LinkedHashMap<>();
-        for (Edge e : allEdges) {
-            graph.computeIfAbsent(e.payer, k -> new ArrayList<>()).add(e);
-        }
-        graph.values().forEach(list -> list.sort(Comparator.comparingInt(e -> e.rowNo)));
-        // 入边：供方 -> 入边列表，按 rowNo 升序（规则 5.2）
-        Map<String, List<Edge>> incoming = new LinkedHashMap<>();
-        for (Edge e : allEdges) {
-            incoming.computeIfAbsent(e.payee, k -> new ArrayList<>()).add(e);
-        }
-        incoming.values().forEach(list -> list.sort(Comparator.comparingInt(e -> e.rowNo)));
-
-        Set<Integer> usedRows = new LinkedHashSet<>(); // 规则 7.1：每条交易只出现一次
-
+        List<Chain> chains = buildChains(allEdges);
         int rowCursor = 0;
-        int maxCol    = 0;
-        int[] maxColRef = {0};
+        int maxCol = 0;
 
-        // 1) 先按配置起点生成链
-        for (String root : roots) {
-            rowCursor = writeChain(out, root, graph, new LinkedHashSet<>(),
-                    0, rowCursor, nameStyle, amtStyle, maxColRef, usedRows, incoming);
-            maxCol = Math.max(maxCol, maxColRef[0]);
-            rowCursor++; // 规则 10：链间空行
-        }
-
-        // 2) 对未使用的交易补链：按原始行号升序，每条以付款方为起点独立成链
-        List<Edge> remaining = new ArrayList<>();
-        for (Edge e : allEdges) {
-            if (!usedRows.contains(e.rowNo)) remaining.add(e);
-        }
-        remaining.sort(Comparator.comparingInt(e -> e.rowNo));
-        for (Edge e : remaining) {
-            rowCursor = writeChain(out, e.payer, graph, new LinkedHashSet<>(),
-                    0, rowCursor, nameStyle, amtStyle, maxColRef, usedRows, incoming);
-            maxCol = Math.max(maxCol, maxColRef[0]);
-            rowCursor++; // 链间空行
+        for (Chain chain : chains) {
+            ChainWriteResult result = writeLinearChain(out, chain, rowCursor, nameStyle, amtStyle);
+            if (result.cols > 0) {
+                maxCol = Math.max(maxCol, result.cols - 1);
+                rowCursor += result.rows; // 名称行 + 金额行（可能多行）
+                rowCursor++;              // 链间空行
+            }
         }
 
         for (int c = 0; c <= maxCol; c++) {
@@ -164,91 +145,149 @@ public class FundFlowService {
         }
     }
 
-    /**
-     * 递归写链：返回写完后的下一可用行。
-     *
-     * 规则要点：
-     * - 每笔交易占两行：名称行 + 金额行（金额写在付款方列）
-     * - 分叉在付款方列下方展开（规则 9）
-     * - 叶节点只写名称行
-     */
-    private int writeChain(Sheet out,
-                           String company,
-                           Map<String, List<Edge>> graph,
-                           LinkedHashSet<String> path,
-                           int col,
-                           int rowStart,
-                           CellStyle nameStyle,
-                           CellStyle amtStyle,
-                           int[] maxCol,
-                           Set<Integer> usedRows,
-                           Map<String, List<Edge>> incoming) {
-        maxCol[0] = Math.max(maxCol[0], col);
+    private List<Chain> buildChains(List<Edge> allEdges) {
+        List<Edge> edges = new ArrayList<>(allEdges);
+        edges.sort(Comparator.comparingInt(e -> e.rowNo));
 
-        List<Edge> edges = graph.getOrDefault(company, Collections.emptyList());
-        boolean hasUnused = false;
+        Map<String, List<Edge>> byPayee = new LinkedHashMap<>();
         for (Edge e : edges) {
-            if (!usedRows.contains(e.rowNo)) {
-                hasUnused = true;
-                break;
+            byPayee.computeIfAbsent(e.payee, k -> new ArrayList<>()).add(e);
+        }
+
+        Set<Integer> usedRows = new LinkedHashSet<>();
+        Deque<String> queue = new ArrayDeque<>();
+        if (!edges.isEmpty()) {
+            queue.add(edges.get(0).payee);
+        }
+
+        List<Chain> chains = new ArrayList<>();
+        while (true) {
+            while (!queue.isEmpty()) {
+                String startPayee = queue.pollFirst();
+                Chain chain = buildChainFromPayee(startPayee, byPayee, usedRows, queue);
+                if (!chain.edges.isEmpty()) {
+                    chains.add(chain);
+                }
+            }
+            Edge next = firstUnusedEdge(edges, usedRows);
+            if (next == null) break;
+            queue.add(next.payee);
+        }
+
+        return chains;
+    }
+
+    private Edge firstUnusedEdge(List<Edge> edges, Set<Integer> usedRows) {
+        for (Edge e : edges) {
+            if (!usedRows.contains(e.rowNo)) return e;
+        }
+        return null;
+    }
+
+    private Chain buildChainFromPayee(String startPayee,
+                                      Map<String, List<Edge>> byPayee,
+                                      Set<Integer> usedRows,
+                                      Deque<String> queue) {
+        Chain chain = new Chain();
+        String current = startPayee;
+        LinkedHashSet<String> path = new LinkedHashSet<>();
+
+        while (true) {
+            if (!path.add(current)) break; // 避免闭环
+
+            List<Edge> candidates = byPayee.getOrDefault(current, Collections.emptyList());
+            if (candidates.isEmpty()) break;
+
+            Map<String, List<Edge>> groups = new LinkedHashMap<>();
+            for (Edge e : candidates) {
+                if (usedRows.contains(e.rowNo)) continue;
+                groups.computeIfAbsent(e.payer, k -> new ArrayList<>()).add(e);
+            }
+            if (groups.isEmpty()) break;
+
+            String chosenPayer = null;
+            int minRow = Integer.MAX_VALUE;
+            for (Map.Entry<String, List<Edge>> entry : groups.entrySet()) {
+                int row = entry.getValue().get(0).rowNo;
+                if (row < minRow) {
+                    minRow = row;
+                    chosenPayer = entry.getKey();
+                }
+            }
+
+            for (String payer : groups.keySet()) {
+                if (!payer.equals(chosenPayer)) {
+                    queue.addLast(current);
+                }
+            }
+
+            List<Edge> chosenEdges = groups.get(chosenPayer);
+            for (int i = chosenEdges.size() - 1; i >= 0; i--) {
+                Edge e = chosenEdges.get(i);
+                usedRows.add(e.rowNo);
+                chain.edges.add(e);
+            }
+
+            current = chosenPayer;
+        }
+
+        return chain;
+    }
+
+    private ChainWriteResult writeLinearChain(Sheet out,
+                                              Chain chain,
+                                              int rowStart,
+                                              CellStyle nameStyle,
+                                              CellStyle amtStyle) {
+        if (chain.edges.isEmpty()) return new ChainWriteResult(0, 0);
+
+        List<Edge> edges = new ArrayList<>(chain.edges);
+        Collections.reverse(edges); // 头 -> 尾
+
+        // 按供方→需方分组，合并同一对公司的多笔交易
+        List<String> companies = new ArrayList<>();
+        List<List<BigDecimal>> amountGroups = new ArrayList<>();
+        
+        companies.add(edges.get(0).payer); // 链头（最终付款方）
+        
+        String lastPayee = null;
+        List<BigDecimal> currentAmounts = null;
+        
+        for (Edge e : edges) {
+            if (!e.payee.equals(lastPayee)) {
+                // 新的供方，创建新列
+                if (currentAmounts != null) {
+                    amountGroups.add(currentAmounts);
+                }
+                companies.add(e.payee);
+                currentAmounts = new ArrayList<>();
+                lastPayee = e.payee;
+            }
+            currentAmounts.add(e.amount);
+        }
+        if (currentAmounts != null) {
+            amountGroups.add(currentAmounts);
+        }
+
+        // 写入公司名称（第一行）
+        int nameRow = rowStart;
+        for (int col = 0; col < companies.size(); col++) {
+            writeNameCell(out, col, nameRow, companies.get(col), nameStyle);
+        }
+
+        // 写入金额（从第二行开始，可能多行）
+        int maxAmounts = 0;
+        for (int col = 0; col < amountGroups.size(); col++) {
+            List<BigDecimal> amounts = amountGroups.get(col);
+            maxAmounts = Math.max(maxAmounts, amounts.size());
+            for (int i = 0; i < amounts.size(); i++) {
+                writeAmountCell(out, col, rowStart + 1 + i, amounts.get(i), amtStyle);
             }
         }
 
-        // 叶节点或闭环：只写公司名
-        if (path.contains(company) || !hasUnused) {
-            writeNameCell(out, col, rowStart, company, nameStyle);
-            return rowStart + 1;
-        }
-
-        LinkedHashSet<String> nextPath = new LinkedHashSet<>(path);
-        nextPath.add(company);
-
-        // 链首优先写一行公司名，防止链首缺失
-        writeNameCell(out, col, rowStart, company, nameStyle);
-
-        int rowCursor = rowStart;
-        for (Edge edge : edges) {
-            if (usedRows.contains(edge.rowNo)) continue;
-            if (!isIncomingOrderOk(edge, usedRows, incoming)) continue;
-            usedRows.add(edge.rowNo);
-
-            int nameRow = rowCursor;
-            int amtRow  = rowCursor + 1;
-
-            // 付款方公司名（每笔交易一行都写，避免出现“只有金额没有公司名”）
-            writeNameCell(out, col, nameRow, company, nameStyle);
-            // 金额（写在付款方列）
-            writeAmountCell(out, col, amtRow, edge.amount, amtStyle);
-
-            // 收款方在右侧继续展开
-            int childEnd = writeChain(out, edge.payee, graph, nextPath,
-                    col + 1, nameRow, nameStyle, amtStyle, maxCol, usedRows, incoming);
-
-            rowCursor = Math.max(amtRow + 1, childEnd);
-        }
-
-        return rowCursor;
+        int totalRows = 1 + maxAmounts; // 名称行 + 金额行数
+        return new ChainWriteResult(companies.size(), totalRows);
     }
-
-    /**
-     * 规则 5.2：同一供方的入边按行号升序优先展示。
-     * 若当前入边前面还有未使用的更小行号入边，则先跳过当前入边。
-     */
-    private boolean isIncomingOrderOk(Edge edge,
-                                      Set<Integer> usedRows,
-                                      Map<String, List<Edge>> incoming) {
-        List<Edge> inList = incoming.get(edge.payee);
-        if (inList == null || inList.isEmpty()) return true;
-        for (Edge e : inList) {
-            if (e.rowNo >= edge.rowNo) break;
-            if (!usedRows.contains(e.rowNo)) return false;
-        }
-        return true;
-    }
-
-    // =========================================================================
-    // 单元格写入
-    // =========================================================================
 
     private void writeNameCell(Sheet out, int col, int row, String name, CellStyle style) {
         Row r = out.getRow(row);
@@ -300,7 +339,7 @@ public class FundFlowService {
             headers.add(getCellStringValue(cell, null));
         }
 
-        int payerIdx  = findHeaderIndex(headers, Arrays.asList("需方", "买方", "需方/提货单位", "需方／提货单位"));
+        int payerIdx  = findHeaderIndex(headers, Arrays.asList("需方", "买方", "需方（提货单位）", "需方／提货单位"));
         int payeeIdx  = findHeaderIndex(headers, Arrays.asList("供方", "卖方", "供方/发货单位", "供方／发货单位"));
         int amountIdx = findHeaderIndex(headers, Collections.singletonList(config.getAmountColumn()));
         if (amountIdx < 0) {
@@ -332,29 +371,6 @@ public class FundFlowService {
     // =========================================================================
     // 辅助方法
     // =========================================================================
-
-    /** 解析起点：优先用配置，配置为空则回退到入度为 0 的付款方。 */
-    private List<String> resolveRoots(List<Edge> edges) {
-        List<String> configured = config.getRootCompanies();
-        if (configured != null) {
-            List<String> valid = new ArrayList<>();
-            for (String s : configured) {
-                if (s != null && !s.trim().isEmpty()) valid.add(s.trim());
-            }
-            if (!valid.isEmpty()) return valid;
-        }
-
-        Set<String> payees = new HashSet<>();
-        for (Edge e : edges) payees.add(e.payee);
-
-        List<String> roots = new ArrayList<>();
-        LinkedHashSet<String> seen = new LinkedHashSet<>();
-        for (Edge e : edges) {
-            if (seen.add(e.payer) && !payees.contains(e.payer)) roots.add(e.payer);
-        }
-        if (roots.isEmpty() && !seen.isEmpty()) roots.add(seen.iterator().next());
-        return roots;
-    }
 
     private static int findHeaderIndex(List<String> headers, List<String> candidates) {
         for (int i = 0; i < headers.size(); i++) {

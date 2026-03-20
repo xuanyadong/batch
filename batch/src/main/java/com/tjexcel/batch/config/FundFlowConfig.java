@@ -3,8 +3,6 @@ package com.tjexcel.batch.config;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
-import java.util.ArrayList;
-import java.util.List;
 
 /**
  * 资金流批量生成配置
@@ -26,8 +24,6 @@ public class FundFlowConfig {
     /** 金额列名，默认价税合计金额 */
     private String amountColumn = "价税合计金额";
 
-    /** 资金流起点公司全称列表（逗号分隔），按顺序逐个展开 */
-    private List<String> rootCompanies = new ArrayList<>();
 
     public String getDataPath() {
         return dataPath;
@@ -61,11 +57,5 @@ public class FundFlowConfig {
         this.amountColumn = amountColumn;
     }
 
-    public List<String> getRootCompanies() {
-        return rootCompanies;
-    }
-
-    public void setRootCompanies(List<String> rootCompanies) {
-        this.rootCompanies = rootCompanies;
-    }
+    // 起点公司不再由配置指定，按数据行顺序自动推导
 }
