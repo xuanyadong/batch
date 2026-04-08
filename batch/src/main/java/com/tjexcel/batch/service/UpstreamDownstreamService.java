@@ -2,7 +2,16 @@ package com.tjexcel.batch.service;
 
 import com.tjexcel.batch.config.UpstreamDownstreamConfig;
 import org.apache.poi.hssf.usermodel.HSSFWorkbook;
-import org.apache.poi.ss.usermodel.*;
+import org.apache.poi.ss.usermodel.Cell;
+import org.apache.poi.ss.usermodel.CellStyle;
+import org.apache.poi.ss.usermodel.CellType;
+import org.apache.poi.ss.usermodel.DateUtil;
+import org.apache.poi.ss.usermodel.Font;
+import org.apache.poi.ss.usermodel.HorizontalAlignment;
+import org.apache.poi.ss.usermodel.Row;
+import org.apache.poi.ss.usermodel.Sheet;
+import org.apache.poi.ss.usermodel.VerticalAlignment;
+import org.apache.poi.ss.usermodel.Workbook;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -19,10 +28,18 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Date;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 /**
- * Generate upstream/downstream table from supplier-demander relations.
+ * Generate upstream/downstream rows and append to a target workbook.
  */
 @Service
 public class UpstreamDownstreamService {
@@ -38,62 +55,156 @@ public class UpstreamDownstreamService {
 
     public int generate() throws IOException {
         Path dataFile = Paths.get(config.getDataPath()).toAbsolutePath();
-        Path outputDir = Paths.get(config.getOutputDir()).toAbsolutePath();
-        Files.createDirectories(outputDir);
+        Path targetFile = Paths.get(config.getTargetFilePath()).toAbsolutePath();
 
         if (!Files.exists(dataFile)) {
             throw new FileNotFoundException("数据表不存在: " + dataFile);
         }
 
-        int generated = 0;
-        try (InputStream is = Files.newInputStream(dataFile);
-             Workbook wb = openWorkbook(is, dataFile)) {
+        Path parent = targetFile.getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
 
-            for (int si = 0; si < wb.getNumberOfSheets(); si++) {
-                Sheet inSheet = wb.getSheetAt(si);
-                if (inSheet == null) continue;
+        int sheetWritten = 0;
+        int rowWritten = 0;
 
-                ParseResult parsed = parseSheet(inSheet);
-                if (parsed.edges.isEmpty()) {
-                    log.warn("Sheet [{}] 没有有效供需关系，跳过", inSheet.getSheetName());
+        try (InputStream dataIs = Files.newInputStream(dataFile);
+             Workbook dataWb = openWorkbook(dataIs, dataFile);
+             Workbook targetWb = openOrCreateWorkbook(targetFile)) {
+
+            Sheet targetSheet = resolveTargetSheet(targetWb, config.getTargetSheetName());
+            CellStyle headerStyle = createHeaderStyle(targetWb);
+            CellStyle textStyle = createTextStyle(targetWb);
+
+            ensureHeader(targetSheet, headerStyle);
+            int rowCursor = findNextAppendRow(targetSheet);
+
+            for (int si = 0; si < dataWb.getNumberOfSheets(); si++) {
+                Sheet inSheet = dataWb.getSheetAt(si);
+                if (inSheet == null) {
                     continue;
                 }
 
-                String fileName = resolveOutputFileName(inSheet.getSheetName());
-                Path outFile = outputDir.resolve(fileName);
-
-                try (XSSFWorkbook outWb = new XSSFWorkbook()) {
-                    String outSheetName = sanitizeSheetName(inSheet.getSheetName());
-                    if (outSheetName.isEmpty()) outSheetName = "上下游客户";
-                    Sheet outSheet = outWb.createSheet(outSheetName);
-                    writeOutput(outWb, outSheet, parsed);
-                    outWb.setForceFormulaRecalculation(true);
-                    try (OutputStream os = Files.newOutputStream(outFile)) {
-                        outWb.write(os);
-                    }
+                ParseResult parsed = parseSheet(inSheet);
+                if (parsed.edges.isEmpty()) {
+                    log.info("Sheet [{}] 没有有效供需关系，跳过", inSheet.getSheetName());
+                    continue;
                 }
 
-                generated++;
-                log.info("Sheet [{}] -> {}", inSheet.getSheetName(), outFile.getFileName());
+                int before = rowCursor;
+                rowCursor = appendParsedRows(targetSheet, rowCursor, parsed, textStyle);
+                int appended = rowCursor - before;
+                rowWritten += appended;
+                sheetWritten++;
+
+                log.info("Sheet [{}] 已追加 {} 行", inSheet.getSheetName(), appended);
+            }
+
+            for (int c = 0; c <= 4; c++) {
+                targetSheet.autoSizeColumn(c);
+                int width = targetSheet.getColumnWidth(c);
+                targetSheet.setColumnWidth(c, Math.max(width, 18 * 256));
+            }
+
+            try (OutputStream os = Files.newOutputStream(targetFile)) {
+                targetWb.write(os);
             }
         }
 
-        log.info("上下游数据表生成完成，共 {} 个文件，输出目录: {}", generated, outputDir);
-        return generated;
+        log.info("上下游写入完成：追加 {} 个sheet，{} 行。目标文件: {}", sheetWritten, rowWritten, targetFile);
+        return sheetWritten;
     }
 
-    private void writeOutput(Workbook wb, Sheet sheet, ParseResult parsed) {
-        CellStyle headerStyle = createHeaderStyle(wb);
-        CellStyle textStyle = createTextStyle(wb);
+    private Workbook openOrCreateWorkbook(Path targetFile) throws IOException {
+        if (Files.exists(targetFile)) {
+            try (InputStream is = Files.newInputStream(targetFile)) {
+                return openWorkbook(is, targetFile);
+            }
+        }
 
-        Row header = sheet.createRow(0);
-        writeCell(header, 0, "月份", headerStyle);
-        writeCell(header, 1, "上游客户", headerStyle);
-        writeCell(header, 2, "客户", headerStyle);
-        writeCell(header, 3, "下游客户", headerStyle);
-        writeCell(header, 4, "产品名", headerStyle);
+        String lower = targetFile.getFileName().toString().toLowerCase();
+        if (lower.endsWith(".xls")) {
+            return new HSSFWorkbook();
+        }
+        return new XSSFWorkbook();
+    }
 
-        int r = 1;
+    private Sheet resolveTargetSheet(Workbook wb, String configuredName) {
+        String name = configuredName == null ? "" : configuredName.trim();
+        if (!name.isEmpty()) {
+            Sheet s = wb.getSheet(name);
+            if (s != null) {
+                return s;
+            }
+            return wb.createSheet(sanitizeSheetName(name));
+        }
+
+        if (wb.getNumberOfSheets() > 0) {
+            return wb.getSheetAt(0);
+        }
+        return wb.createSheet("Sheet1");
+    }
+
+    private void ensureHeader(Sheet sheet, CellStyle headerStyle) {
+        Row row0 = sheet.getRow(0);
+        if (row0 == null) {
+            row0 = sheet.createRow(0);
+        }
+
+        boolean hasHeader = false;
+        Cell c0 = row0.getCell(0);
+        if (c0 != null && c0.getCellType() == CellType.STRING) {
+            hasHeader = "月份".equals(c0.getStringCellValue());
+        }
+        if (hasHeader) {
+            return;
+        }
+
+        writeCell(row0, 0, "月份", headerStyle);
+        writeCell(row0, 1, "上游客户", headerStyle);
+        writeCell(row0, 2, "客户", headerStyle);
+        writeCell(row0, 3, "下游客户", headerStyle);
+        writeCell(row0, 4, "产品名", headerStyle);
+    }
+
+    private int findNextAppendRow(Sheet sheet) {
+        int last = sheet.getLastRowNum();
+        for (int r = last; r >= 0; r--) {
+            Row row = sheet.getRow(r);
+            if (!isRowEmpty(row)) {
+                return r + 1;
+            }
+        }
+        return 0;
+    }
+
+    private boolean isRowEmpty(Row row) {
+        if (row == null) {
+            return true;
+        }
+        short last = row.getLastCellNum();
+        if (last < 0) {
+            return true;
+        }
+        for (int c = 0; c < last; c++) {
+            Cell cell = row.getCell(c);
+            if (cell == null) {
+                continue;
+            }
+            if (cell.getCellType() == CellType.BLANK) {
+                continue;
+            }
+            String val = getCellStringValue(cell).trim();
+            if (!val.isEmpty()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private int appendParsedRows(Sheet targetSheet, int rowStart, ParseResult parsed, CellStyle textStyle) {
+        int rowCursor = rowStart;
         for (String company : parsed.companyOrder) {
             List<String> upstreams = new ArrayList<>(parsed.upstreams.getOrDefault(company, Collections.emptySet()));
             List<String> downstreams = new ArrayList<>(parsed.downstreams.getOrDefault(company, Collections.emptySet()));
@@ -104,7 +215,7 @@ public class UpstreamDownstreamService {
             }
 
             for (int i = 0; i < rowCount; i++) {
-                Row row = sheet.createRow(r++);
+                Row row = targetSheet.createRow(rowCursor++);
                 writeCell(row, 0, parsed.monthValue, textStyle);
                 writeCell(row, 1, pickByRepeatLast(upstreams, i), textStyle);
                 writeCell(row, 2, company, textStyle);
@@ -112,12 +223,7 @@ public class UpstreamDownstreamService {
                 writeCell(row, 4, parsed.productValue, textStyle);
             }
         }
-
-        for (int c = 0; c <= 4; c++) {
-            sheet.autoSizeColumn(c);
-            int width = sheet.getColumnWidth(c);
-            sheet.setColumnWidth(c, Math.max(width, 18 * 256));
-        }
+        return rowCursor;
     }
 
     private ParseResult parseSheet(Sheet sheet) {
@@ -145,11 +251,15 @@ public class UpstreamDownstreamService {
         Set<String> edgeSet = new LinkedHashSet<>();
         for (int r = 1; r <= sheet.getLastRowNum(); r++) {
             Row row = sheet.getRow(r);
-            if (row == null) continue;
+            if (row == null) {
+                continue;
+            }
 
             String supplier = getCellStringValue(row.getCell(supplierIdx)).trim();
             String demander = getCellStringValue(row.getCell(demanderIdx)).trim();
-            if (supplier.isEmpty() || demander.isEmpty()) continue;
+            if (supplier.isEmpty() || demander.isEmpty()) {
+                continue;
+            }
 
             if (result.monthValue.isEmpty() && signingTimeIdx >= 0) {
                 result.monthValue = formatYearMonthFromSigningTime(row.getCell(signingTimeIdx));
@@ -175,14 +285,18 @@ public class UpstreamDownstreamService {
     }
 
     private void ensureCompany(ParseResult result, String company) {
-        if (!result.companySeen.add(company)) return;
+        if (!result.companySeen.add(company)) {
+            return;
+        }
         result.companyOrder.add(company);
     }
 
     private List<String> readHeaders(Row headerRow) {
         List<String> headers = new ArrayList<>();
         short lastCellNum = headerRow.getLastCellNum();
-        if (lastCellNum < 0) return headers;
+        if (lastCellNum < 0) {
+            return headers;
+        }
         for (int c = 0; c < lastCellNum; c++) {
             headers.add(getCellStringValue(headerRow.getCell(c)).trim());
         }
@@ -193,20 +307,31 @@ public class UpstreamDownstreamService {
         for (int i = 0; i < headers.size(); i++) {
             String h = headers.get(i);
             for (String c : candidates) {
-                if (h.equals(c)) return i;
+                if (h.equals(c)) {
+                    return i;
+                }
             }
         }
         return -1;
     }
 
     private String pickByRepeatLast(List<String> values, int index) {
-        if (values.isEmpty()) return "";
-        if (index < values.size()) return values.get(index);
+        if (values.isEmpty()) {
+            return "";
+        }
+        if (index < values.size()) {
+            return values.get(index);
+        }
         return values.get(values.size() - 1);
     }
 
     private void writeCell(Row row, int col, String val, CellStyle style) {
-        Cell cell = row.createCell(col, CellType.STRING);
+        Cell cell = row.getCell(col);
+        if (cell == null) {
+            cell = row.createCell(col, CellType.STRING);
+        } else {
+            cell.setCellType(CellType.STRING);
+        }
         cell.setCellStyle(style);
         cell.setCellValue(val == null ? "" : val);
     }
@@ -233,31 +358,21 @@ public class UpstreamDownstreamService {
         return name.endsWith(".xlsx") ? new XSSFWorkbook(is) : new HSSFWorkbook(is);
     }
 
-    private String resolveOutputFileName(String sheetName) {
-        String pattern = config.getOutputFileNamePattern();
-        if (pattern == null || pattern.trim().isEmpty()) {
-            pattern = "上下游客户-${sheet}.xlsx";
-        }
-        String result = pattern.replace("${sheet}", sanitizeFileName(sheetName));
-        result = sanitizeFileName(result);
-        if (!result.toLowerCase().endsWith(".xlsx")) {
-            result = result + ".xlsx";
-        }
-        return result;
-    }
-
-    private String sanitizeFileName(String name) {
-        if (name == null) return "";
-        return name.replaceAll("[\\\\/:*?\"<>|]", "_").trim();
-    }
-
     private String sanitizeSheetName(String name) {
-        String safe = sanitizeFileName(name);
+        if (name == null) {
+            return "Sheet1";
+        }
+        String safe = name.replaceAll("[\\\\/:*?\"<>|]", "_").trim();
+        if (safe.isEmpty()) {
+            safe = "Sheet1";
+        }
         return safe.length() <= 31 ? safe : safe.substring(0, 31);
     }
 
     private String getCellStringValue(Cell cell) {
-        if (cell == null) return "";
+        if (cell == null) {
+            return "";
+        }
         switch (cell.getCellType()) {
             case STRING:
                 return cell.getStringCellValue();
@@ -308,7 +423,9 @@ public class UpstreamDownstreamService {
     }
 
     private String formatYearMonthFromSigningTime(Cell cell) {
-        if (cell == null) return "";
+        if (cell == null) {
+            return "";
+        }
         try {
             switch (cell.getCellType()) {
                 case STRING:
@@ -333,7 +450,9 @@ public class UpstreamDownstreamService {
     }
 
     private String formatYearMonthFromNumeric(double value) {
-        if (Double.isNaN(value) || Double.isInfinite(value)) return "";
+        if (Double.isNaN(value) || Double.isInfinite(value)) {
+            return "";
+        }
         if (value > 20000 && value < 80000) {
             Date date = DateUtil.getJavaDate(value, false);
             LocalDate localDate = Instant.ofEpochMilli(date.getTime())
@@ -346,9 +465,13 @@ public class UpstreamDownstreamService {
     }
 
     private String formatYearMonthFromText(String raw) {
-        if (raw == null) return "";
+        if (raw == null) {
+            return "";
+        }
         String s = raw.trim();
-        if (s.isEmpty()) return "";
+        if (s.isEmpty()) {
+            return "";
+        }
 
         if (s.matches("^\\d+(\\.0+)?$")) {
             try {
@@ -361,7 +484,6 @@ public class UpstreamDownstreamService {
         }
 
         String normalized = s.replace("/", "-").replace(".", "-");
-
         for (DateTimeFormatter fmt : Arrays.asList(
                 DateTimeFormatter.ofPattern("yyyy-M-d"),
                 DateTimeFormatter.ofPattern("yyyy-MM-dd")

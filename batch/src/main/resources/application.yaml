@@ -15,20 +15,19 @@ bill-of-lading:
   template-path: C:\Users\Skye ding\Desktop\batch\batch\bill-of-lading.xlsx
   output-dir: C:\Users\Skye ding\Desktop\batch\batch\output_bill
   output-file-name-pattern: "提单-${供方简称}-${需方简称}-${提单编号}.xls"
-  # 拆单配置
   split-min: 50
   split-max: 495
   split-max-sub-count: 30
 
-# 资金流批量生成配
+# 资金流批量生成配置
 fund-flow:
   data-path: D:\test\batch\数据模板.xlsx
   output-dir: D:\test\batch\output_fund
   output-file-name: 资金流.xls
   amount-column: 价税合计金额
 
-# 上下游数据表批量生成配置
+# 上下游数据表写入配置（追加写入目标文件）
 upstream-downstream:
   data-path: D:\test\batch\数据模板.xlsx
-  output-dir: D:\test\batch\output_upstream_downstream
-  output-file-name-pattern: 上下游客户-${sheet}.xlsx
+  target-file-path: D:\test\batch\聚乙烯上下游客户260407.xlsx
+  target-sheet-name: 3

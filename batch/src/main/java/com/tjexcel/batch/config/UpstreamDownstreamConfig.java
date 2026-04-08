@@ -4,20 +4,20 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
 /**
- * Upstream/downstream table generation config.
+ * Upstream/downstream append-write config.
  */
 @Component
 @ConfigurationProperties(prefix = "upstream-downstream")
 public class UpstreamDownstreamConfig {
 
-    /** Input data workbook path (same style as existing features). */
-    private String dataPath = "D:/test/batch/数据模板.xlsx";
+    /** Input data workbook path. */
+    private String dataPath = "D:/test/batch/鏁版嵁妯℃澘.xlsx";
 
-    /** Output directory. */
-    private String outputDir = "D:/test/batch/output_upstream_downstream";
+    /** Target upstream-downstream workbook path (append into this file). */
+    private String targetFilePath = "D:/test/batch/鑱氫箼鐑笂涓嬫父瀹㈡埛260407.xlsx";
 
-    /** Output file name pattern. Supports ${sheet}. */
-    private String outputFileNamePattern = "上下游客户-${sheet}.xlsx";
+    /** Target sheet name in target workbook. Blank means first sheet. */
+    private String targetSheetName = "";
 
     public String getDataPath() {
         return dataPath;
@@ -27,19 +27,19 @@ public class UpstreamDownstreamConfig {
         this.dataPath = dataPath;
     }
 
-    public String getOutputDir() {
-        return outputDir;
+    public String getTargetFilePath() {
+        return targetFilePath;
     }
 
-    public void setOutputDir(String outputDir) {
-        this.outputDir = outputDir;
+    public void setTargetFilePath(String targetFilePath) {
+        this.targetFilePath = targetFilePath;
     }
 
-    public String getOutputFileNamePattern() {
-        return outputFileNamePattern;
+    public String getTargetSheetName() {
+        return targetSheetName;
     }
 
-    public void setOutputFileNamePattern(String outputFileNamePattern) {
-        this.outputFileNamePattern = outputFileNamePattern;
+    public void setTargetSheetName(String targetSheetName) {
+        this.targetSheetName = targetSheetName;
     }
 }
