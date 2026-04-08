@@ -15,6 +15,10 @@ import java.io.OutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 
 /**
@@ -24,6 +28,7 @@ import java.util.*;
 public class UpstreamDownstreamService {
 
     private static final Logger log = LoggerFactory.getLogger(UpstreamDownstreamService.class);
+    private static final DateTimeFormatter YEAR_MONTH_FMT = DateTimeFormatter.ofPattern("yyyy年MM月");
 
     private final UpstreamDownstreamConfig config;
 
@@ -129,7 +134,7 @@ public class UpstreamDownstreamService {
         List<String> headers = readHeaders(headerRow);
         int supplierIdx = findHeaderIndex(headers, Arrays.asList("供方", "卖方", "供方/发货单位", "供方／发货单位"));
         int demanderIdx = findHeaderIndex(headers, Arrays.asList("需方", "买方", "需方/提货单位", "需方／提货单位"));
-        int monthIdx = findHeaderIndex(headers, Arrays.asList("月份", "签约时间", "签发时间"));
+        int signingTimeIdx = findHeaderIndex(headers, Collections.singletonList("签约时间"));
         int productIdx = findHeaderIndex(headers, Arrays.asList("产品名", "品名", "商品名称"));
 
         if (supplierIdx < 0 || demanderIdx < 0) {
@@ -146,8 +151,8 @@ public class UpstreamDownstreamService {
             String demander = getCellStringValue(row.getCell(demanderIdx)).trim();
             if (supplier.isEmpty() || demander.isEmpty()) continue;
 
-            if (result.monthValue.isEmpty() && monthIdx >= 0) {
-                result.monthValue = getCellStringValue(row.getCell(monthIdx)).trim();
+            if (result.monthValue.isEmpty() && signingTimeIdx >= 0) {
+                result.monthValue = formatYearMonthFromSigningTime(row.getCell(signingTimeIdx));
             }
             if (result.productValue.isEmpty() && productIdx >= 0) {
                 result.productValue = getCellStringValue(row.getCell(productIdx)).trim();
@@ -300,6 +305,91 @@ public class UpstreamDownstreamService {
             default:
                 return "";
         }
+    }
+
+    private String formatYearMonthFromSigningTime(Cell cell) {
+        if (cell == null) return "";
+        try {
+            switch (cell.getCellType()) {
+                case STRING:
+                    return formatYearMonthFromText(cell.getStringCellValue());
+                case NUMERIC:
+                    return formatYearMonthFromNumeric(cell.getNumericCellValue());
+                case FORMULA:
+                    switch (cell.getCachedFormulaResultType()) {
+                        case STRING:
+                            return formatYearMonthFromText(cell.getStringCellValue());
+                        case NUMERIC:
+                            return formatYearMonthFromNumeric(cell.getNumericCellValue());
+                        default:
+                            return "";
+                    }
+                default:
+                    return "";
+            }
+        } catch (Exception ignored) {
+            return "";
+        }
+    }
+
+    private String formatYearMonthFromNumeric(double value) {
+        if (Double.isNaN(value) || Double.isInfinite(value)) return "";
+        if (value > 20000 && value < 80000) {
+            Date date = DateUtil.getJavaDate(value, false);
+            LocalDate localDate = Instant.ofEpochMilli(date.getTime())
+                    .atZone(ZoneId.systemDefault())
+                    .toLocalDate();
+            return YEAR_MONTH_FMT.format(localDate);
+        }
+        String raw = (value == Math.floor(value)) ? String.valueOf((long) value) : String.valueOf(value);
+        return formatYearMonthFromText(raw);
+    }
+
+    private String formatYearMonthFromText(String raw) {
+        if (raw == null) return "";
+        String s = raw.trim();
+        if (s.isEmpty()) return "";
+
+        if (s.matches("^\\d+(\\.0+)?$")) {
+            try {
+                double serial = Double.parseDouble(s);
+                if (serial > 20000 && serial < 80000) {
+                    return formatYearMonthFromNumeric(serial);
+                }
+            } catch (Exception ignored) {
+            }
+        }
+
+        String normalized = s.replace("/", "-").replace(".", "-");
+
+        for (DateTimeFormatter fmt : Arrays.asList(
+                DateTimeFormatter.ofPattern("yyyy-M-d"),
+                DateTimeFormatter.ofPattern("yyyy-MM-dd")
+        )) {
+            try {
+                return YEAR_MONTH_FMT.format(LocalDate.parse(normalized, fmt));
+            } catch (Exception ignored) {
+            }
+        }
+
+        if (normalized.matches("^\\d{8}$")) {
+            try {
+                return YEAR_MONTH_FMT.format(LocalDate.parse(normalized, DateTimeFormatter.BASIC_ISO_DATE));
+            } catch (Exception ignored) {
+            }
+        }
+
+        if (normalized.matches("^\\d{4}-\\d{1,2}$")) {
+            try {
+                String[] parts = normalized.split("-");
+                int year = Integer.parseInt(parts[0]);
+                int month = Integer.parseInt(parts[1]);
+                return YEAR_MONTH_FMT.format(LocalDate.of(year, month, 1));
+            } catch (Exception ignored) {
+            }
+        }
+
+        return "";
     }
 
     private static class Edge {

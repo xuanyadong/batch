@@ -12,7 +12,7 @@
 	<artifactId>batch</artifactId>
 	<version>0.0.1-SNAPSHOT</version>
 	<name>batch</name>
-	<description>Demo project for Spring Boot</description>
+	<description>tjexcel</description>
 	<url/>
 	<licenses>
 		<license/>
