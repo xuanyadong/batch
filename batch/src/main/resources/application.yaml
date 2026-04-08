@@ -26,3 +26,9 @@ fund-flow:
   output-dir: D:\test\batch\output_fund
   output-file-name: 资金流.xls
   amount-column: 价税合计金额
+
+# 上下游数据表批量生成配置
+upstream-downstream:
+  data-path: D:\test\batch\数据模板.xlsx
+  output-dir: D:\test\batch\output_upstream_downstream
+  output-file-name-pattern: 上下游客户-${sheet}.xlsx

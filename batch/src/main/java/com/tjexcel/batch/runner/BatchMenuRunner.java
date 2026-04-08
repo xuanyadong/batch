@@ -1,9 +1,10 @@
 package com.tjexcel.batch.runner;
 
 import com.tjexcel.batch.config.ContractConfig;
-import com.tjexcel.batch.service.FundFlowService;
 import com.tjexcel.batch.service.BillOfLadingService;
 import com.tjexcel.batch.service.ContractGeneratorService;
+import com.tjexcel.batch.service.FundFlowService;
+import com.tjexcel.batch.service.UpstreamDownstreamService;
 import com.tjexcel.batch.util.ExcelInspector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -19,7 +20,7 @@ import java.util.Arrays;
 import java.util.Scanner;
 
 /**
- * 启动时显示菜单，由用户选择要生成的文件类型
+ * 启动菜单：1合同 2提单 3资金流 4上下游数据表
  */
 @Component
 @Order(0)
@@ -30,15 +31,18 @@ public class BatchMenuRunner implements CommandLineRunner {
     private final ContractGeneratorService contractGeneratorService;
     private final BillOfLadingService billOfLadingService;
     private final FundFlowService fundFlowService;
+    private final UpstreamDownstreamService upstreamDownstreamService;
     private final ContractConfig contractConfig;
 
     public BatchMenuRunner(ContractGeneratorService contractGeneratorService,
-                          BillOfLadingService billOfLadingService,
-                          FundFlowService fundFlowService,
-                          ContractConfig contractConfig) {
+                           BillOfLadingService billOfLadingService,
+                           FundFlowService fundFlowService,
+                           UpstreamDownstreamService upstreamDownstreamService,
+                           ContractConfig contractConfig) {
         this.contractGeneratorService = contractGeneratorService;
         this.billOfLadingService = billOfLadingService;
         this.fundFlowService = fundFlowService;
+        this.upstreamDownstreamService = upstreamDownstreamService;
         this.contractConfig = contractConfig;
     }
 
@@ -53,11 +57,12 @@ public class BatchMenuRunner implements CommandLineRunner {
         System.out.println("====================== 批量生成 ======================");
         System.out.println("请选择要生成的文件：");
         System.out.println("  1 - 合同");
-        System.out.println("  2 - 提单表");
+        System.out.println("  2 - 提单");
         System.out.println("  3 - 资金流");
+        System.out.println("  4 - 上下游数据表");
         System.out.println("  0 - 退出");
         System.out.println("====================================================");
-        System.out.print("请输入选项 (0-3): ");
+        System.out.print("请输入选项 (0-4): ");
 
         String input;
         try (Scanner scanner = new Scanner(System.in)) {
@@ -77,13 +82,16 @@ public class BatchMenuRunner implements CommandLineRunner {
             case "3":
                 runFundFlow();
                 break;
+            case "4":
+                runUpstreamDownstream();
+                break;
             case "0":
                 log.info("用户选择退出");
                 System.exit(0);
                 break;
             default:
                 log.warn("无效选项: {}", input);
-                System.out.println("无效选项，请输入 0、1、2 或 3");
+                System.out.println("无效选项，请输入 0、1、2、3 或 4");
                 System.exit(1);
         }
     }
@@ -120,6 +128,18 @@ public class BatchMenuRunner implements CommandLineRunner {
             System.exit(0);
         } catch (Exception e) {
             log.error("资金流生成失败", e);
+            System.exit(1);
+        }
+    }
+
+    private void runUpstreamDownstream() {
+        log.info("开始执行上下游数据表生成...");
+        try {
+            int count = upstreamDownstreamService.generate();
+            log.info("上下游数据表生成完成，共生成 {} 个文件", count);
+            System.exit(0);
+        } catch (Exception e) {
+            log.error("上下游数据表生成失败", e);
             System.exit(1);
         }
     }
