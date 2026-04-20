@@ -3,7 +3,9 @@ package com.tjexcel.batch.runner;
 import com.tjexcel.batch.config.ContractConfig;
 import com.tjexcel.batch.service.BillOfLadingService;
 import com.tjexcel.batch.service.ContractGeneratorService;
+import com.tjexcel.batch.service.CustomerBelongingExtractService;
 import com.tjexcel.batch.service.FundFlowService;
+import com.tjexcel.batch.service.PdfRenameService;
 import com.tjexcel.batch.service.UpstreamDownstreamService;
 import com.tjexcel.batch.util.ExcelInspector;
 import org.slf4j.Logger;
@@ -32,17 +34,23 @@ public class BatchMenuRunner implements CommandLineRunner {
     private final BillOfLadingService billOfLadingService;
     private final FundFlowService fundFlowService;
     private final UpstreamDownstreamService upstreamDownstreamService;
+    private final PdfRenameService pdfRenameService;
+    private final CustomerBelongingExtractService customerBelongingExtractService;
     private final ContractConfig contractConfig;
 
     public BatchMenuRunner(ContractGeneratorService contractGeneratorService,
                            BillOfLadingService billOfLadingService,
                            FundFlowService fundFlowService,
                            UpstreamDownstreamService upstreamDownstreamService,
+                           PdfRenameService pdfRenameService,
+                           CustomerBelongingExtractService customerBelongingExtractService,
                            ContractConfig contractConfig) {
         this.contractGeneratorService = contractGeneratorService;
         this.billOfLadingService = billOfLadingService;
         this.fundFlowService = fundFlowService;
         this.upstreamDownstreamService = upstreamDownstreamService;
+        this.pdfRenameService = pdfRenameService;
+        this.customerBelongingExtractService = customerBelongingExtractService;
         this.contractConfig = contractConfig;
     }
 
@@ -60,9 +68,11 @@ public class BatchMenuRunner implements CommandLineRunner {
         System.out.println("  2 - 提单");
         System.out.println("  3 - 资金流");
         System.out.println("  4 - 上下游数据表");
+        System.out.println("  5 - PDF识别重命名");
+        System.out.println("  6 - 客属表文件提取");
         System.out.println("  0 - 退出");
         System.out.println("====================================================");
-        System.out.print("请输入选项 (0-4): ");
+        System.out.print("请输入选项 (0-6): ");
 
         String input;
         try (Scanner scanner = new Scanner(System.in)) {
@@ -85,13 +95,19 @@ public class BatchMenuRunner implements CommandLineRunner {
             case "4":
                 runUpstreamDownstream();
                 break;
+            case "5":
+                runPdfRename();
+                break;
+            case "6":
+                runCustomerBelongingExtract();
+                break;
             case "0":
                 log.info("用户选择退出");
                 System.exit(0);
                 break;
             default:
                 log.warn("无效选项: {}", input);
-                System.out.println("无效选项，请输入 0、1、2、3 或 4");
+                System.out.println("无效选项，请输入 0、1、2、3、4、5 或 6");
                 System.exit(1);
         }
     }
@@ -140,6 +156,30 @@ public class BatchMenuRunner implements CommandLineRunner {
             System.exit(0);
         } catch (Exception e) {
             log.error("上下游数据表生成失败", e);
+            System.exit(1);
+        }
+    }
+
+    private void runPdfRename() {
+        log.info("开始执行 PDF OCR 重命名...");
+        try {
+            int count = pdfRenameService.renameByOcr();
+            log.info("PDF OCR 重命名执行完成，处理成功 {} 个文件", count);
+            System.exit(0);
+        } catch (Exception e) {
+            log.error("PDF OCR 重命名执行失败", e);
+            System.exit(1);
+        }
+    }
+
+    private void runCustomerBelongingExtract() {
+        log.info("开始执行客属表文件提取...");
+        try {
+            int count = customerBelongingExtractService.extract();
+            log.info("客属表文件提取完成，命中 {} 个文件", count);
+            System.exit(0);
+        } catch (Exception e) {
+            log.error("客属表文件提取失败", e);
             System.exit(1);
         }
     }

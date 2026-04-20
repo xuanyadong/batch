@@ -1,4 +1,4 @@
-spring:
+﻿spring:
   application:
     name: batch
 
@@ -31,3 +31,22 @@ upstream-downstream:
   data-path: D:\test\batch\数据模板.xlsx
   target-file-path: D:\test\batch\聚乙烯上下游客户260407.xlsx
   target-sheet-name: 3
+
+# PDF OCR 扫描重命名（功能5）
+pdf-rename:
+  scan-dir: D:\test\batch\pdf
+  recursive: false
+  tesseract-exe-path: D:\Tesseract-OCR\tesseract.exe
+  language: chi_sim
+  dpi: 200
+  max-pages: 0
+  dry-run: false
+  fast-mode: true
+  psm: 6
+
+# 客属表文件提取（功能6）
+customer-belonging-extract:
+  data-path: D:\test\batch\客属表.xlsx
+  source-zip-path: D:\test\batch\客属表文件.zip
+  output-dir: D:\test\batch\output_customer_extract
+  company-column-name: 企业抬头

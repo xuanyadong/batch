@@ -2,9 +2,8 @@ package com.tjexcel.batch.service;
 
 import com.tjexcel.batch.config.BillOfLadingConfig;
 import com.tjexcel.batch.util.OrderSplitUtil;
-import net.sourceforge.pinyin4j.PinyinHelper;
-import net.sourceforge.pinyin4j.format.HanyuPinyinOutputFormat;
-import net.sourceforge.pinyin4j.format.HanyuPinyinToneType;
+import com.github.stuxuhai.jpinyin.PinyinException;
+import com.github.stuxuhai.jpinyin.PinyinFormat;
 import org.apache.poi.hssf.usermodel.HSSFWorkbook;
 import org.apache.poi.ss.usermodel.*;
 import org.apache.poi.ss.util.CellRangeAddress;
@@ -550,20 +549,26 @@ public class BillOfLadingService {
 
     private String toPinyinInitials(String str) {
         if (str == null || str.isEmpty()) return "";
-        HanyuPinyinOutputFormat format = new HanyuPinyinOutputFormat();
-        format.setToneType(HanyuPinyinToneType.WITHOUT_TONE);
         StringBuilder sb = new StringBuilder();
-        for (char c : str.toCharArray()) {
-            if (Character.toString(c).matches("[\\u4e00-\\u9fa5]")) {
-                try {
-                    String[] py = PinyinHelper.toHanyuPinyinStringArray(c, format);
-                    if (py != null && py.length > 0) sb.append(py[0].charAt(0));
-                } catch (Exception ignored) {}
-            } else if (Character.isLetterOrDigit(c)) {
-                sb.append(c);
+        try {
+            String pinyin = com.github.stuxuhai.jpinyin.PinyinHelper.convertToPinyinString(str, " ", PinyinFormat.WITHOUT_TONE);
+            String[] tokens = pinyin.trim().split("\\s+");
+            for (String token : tokens) {
+                if (token == null || token.isEmpty()) continue;
+                char first = token.charAt(0);
+                if (Character.isLetterOrDigit(first)) {
+                    sb.append(first);
+                }
             }
+            return sb.toString();
+        } catch (PinyinException e) {
+            for (char c : str.toCharArray()) {
+                if (Character.isLetterOrDigit(c)) {
+                    sb.append(c);
+                }
+            }
+            return sb.toString();
         }
-        return sb.toString();
     }
 
     /**
