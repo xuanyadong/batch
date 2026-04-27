@@ -50,3 +50,11 @@ customer-belonging-extract:
   source-zip-path: D:\test\batch\客属表文件.zip
   output-dir: D:\test\batch\output_customer_extract
   company-column-name: 企业抬头
+
+# 客属表数据提取（功能7）
+customer-belonging-data-extract:
+  customer-table-path: D:\test\batch\客属表.xlsx
+  data-table-path: D:\test\batch\数据模板.xlsx
+  output-dir: D:\test\batch\output_customer_data_extract
+  company-column-name: 企业抬头
+  extract-columns: 供方|需方|签约时间|产品名|规格型号|数量|单位|单价（含税）|价税合计金额|账面利润

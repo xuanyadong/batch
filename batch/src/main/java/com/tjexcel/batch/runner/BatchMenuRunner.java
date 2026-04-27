@@ -4,6 +4,7 @@ import com.tjexcel.batch.config.ContractConfig;
 import com.tjexcel.batch.service.BillOfLadingService;
 import com.tjexcel.batch.service.ContractGeneratorService;
 import com.tjexcel.batch.service.CustomerBelongingExtractService;
+import com.tjexcel.batch.service.CustomerBelongingDataExtractService;
 import com.tjexcel.batch.service.FundFlowService;
 import com.tjexcel.batch.service.PdfRenameService;
 import com.tjexcel.batch.service.UpstreamDownstreamService;
@@ -36,6 +37,7 @@ public class BatchMenuRunner implements CommandLineRunner {
     private final UpstreamDownstreamService upstreamDownstreamService;
     private final PdfRenameService pdfRenameService;
     private final CustomerBelongingExtractService customerBelongingExtractService;
+    private final CustomerBelongingDataExtractService customerBelongingDataExtractService;
     private final ContractConfig contractConfig;
 
     public BatchMenuRunner(ContractGeneratorService contractGeneratorService,
@@ -44,6 +46,7 @@ public class BatchMenuRunner implements CommandLineRunner {
                            UpstreamDownstreamService upstreamDownstreamService,
                            PdfRenameService pdfRenameService,
                            CustomerBelongingExtractService customerBelongingExtractService,
+                           CustomerBelongingDataExtractService customerBelongingDataExtractService,
                            ContractConfig contractConfig) {
         this.contractGeneratorService = contractGeneratorService;
         this.billOfLadingService = billOfLadingService;
@@ -51,6 +54,7 @@ public class BatchMenuRunner implements CommandLineRunner {
         this.upstreamDownstreamService = upstreamDownstreamService;
         this.pdfRenameService = pdfRenameService;
         this.customerBelongingExtractService = customerBelongingExtractService;
+        this.customerBelongingDataExtractService = customerBelongingDataExtractService;
         this.contractConfig = contractConfig;
     }
 
@@ -70,9 +74,10 @@ public class BatchMenuRunner implements CommandLineRunner {
         System.out.println("  4 - 上下游数据表");
         System.out.println("  5 - PDF识别重命名");
         System.out.println("  6 - 客属表文件提取");
+        System.out.println("  7 - 客属表数据提取");
         System.out.println("  0 - 退出");
         System.out.println("====================================================");
-        System.out.print("请输入选项 (0-6): ");
+        System.out.print("请输入选项 (0-7): ");
 
         String input;
         try (Scanner scanner = new Scanner(System.in)) {
@@ -101,13 +106,16 @@ public class BatchMenuRunner implements CommandLineRunner {
             case "6":
                 runCustomerBelongingExtract();
                 break;
+            case "7":
+                runCustomerBelongingDataExtract();
+                break;
             case "0":
                 log.info("用户选择退出");
                 System.exit(0);
                 break;
             default:
                 log.warn("无效选项: {}", input);
-                System.out.println("无效选项，请输入 0、1、2、3、4、5 或 6");
+                System.out.println("无效选项，请输入 0、1、2、3、4、5、6 或 7");
                 System.exit(1);
         }
     }
@@ -180,6 +188,18 @@ public class BatchMenuRunner implements CommandLineRunner {
             System.exit(0);
         } catch (Exception e) {
             log.error("客属表文件提取失败", e);
+            System.exit(1);
+        }
+    }
+
+    private void runCustomerBelongingDataExtract() {
+        log.info("开始执行客属表数据提取...");
+        try {
+            int count = customerBelongingDataExtractService.extract();
+            log.info("客属表数据提取完成，共生成 {} 个公司汇总文件", count);
+            System.exit(0);
+        } catch (Exception e) {
+            log.error("客属表数据提取失败", e);
             System.exit(1);
         }
     }
