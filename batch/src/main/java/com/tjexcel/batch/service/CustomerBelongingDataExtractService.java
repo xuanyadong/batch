@@ -3,16 +3,16 @@ package com.tjexcel.batch.service;
 import com.tjexcel.batch.config.CustomerBelongingDataExtractConfig;
 import org.apache.poi.hssf.usermodel.HSSFWorkbook;
 import org.apache.poi.ss.usermodel.Cell;
-import org.apache.poi.ss.usermodel.CellType;
-import org.apache.poi.ss.usermodel.DataFormatter;
-import org.apache.poi.ss.usermodel.CellValue;
 import org.apache.poi.ss.usermodel.CellStyle;
+import org.apache.poi.ss.usermodel.CellType;
+import org.apache.poi.ss.usermodel.CellValue;
 import org.apache.poi.ss.usermodel.CreationHelper;
+import org.apache.poi.ss.usermodel.DataFormatter;
+import org.apache.poi.ss.usermodel.FormulaEvaluator;
 import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.ss.usermodel.Sheet;
 import org.apache.poi.ss.usermodel.Workbook;
 import org.apache.poi.ss.usermodel.WorkbookFactory;
-import org.apache.poi.ss.usermodel.FormulaEvaluator;
 import org.apache.poi.xssf.usermodel.XSSFWorkbook;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -27,13 +27,13 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
-import java.util.HashMap;
 
 @Service
 public class CustomerBelongingDataExtractService {
@@ -52,9 +52,9 @@ public class CustomerBelongingDataExtractService {
 
     /**
      * 客属表数据提取（功能7）：
-     * 1) 从客属表按sheet读取公司
+     * 1) 从客属表按 sheet 读取公司
      * 2) 在数据表中匹配供方/需方
-     * 3) 每个sheet生成文件夹，每个公司输出一个“公司名称-汇总表.xlsx”
+     * 3) 每个客属表 sheet 输出一个“sheet名-汇总表.xlsx”
      */
     public int extract() throws IOException {
         Path customerPath = Paths.get(config.getCustomerTablePath()).toAbsolutePath();
@@ -84,19 +84,20 @@ public class CustomerBelongingDataExtractService {
         int generatedCount = 0;
 
         for (Map.Entry<String, Set<String>> sheetCompanies : companiesBySheet.entrySet()) {
-            String folderName = sanitizeName(sheetCompanies.getKey(), "sheet");
-            Path sheetOutputDir = outputDir.resolve(folderName);
-            Files.createDirectories(sheetOutputDir);
-
-            for (String company : sheetCompanies.getValue()) {
-                String companyName = defaultIfBlank(company, "").trim();
-                if (companyName.isEmpty()) {
-                    continue;
-                }
-                List<Map<String, CellSnapshot>> hitRows = filterRowsForCompany(sourceData.rows, companyName, extractColumns);
-                writeCompanyWorkbook(sheetOutputDir, companyName, extractColumns, hitRows, sourceData.columnWidthByHeader);
-                generatedCount++;
+            String sheetName = sheetCompanies.getKey();
+            Set<String> companies = normalizeCompanies(sheetCompanies.getValue());
+            if (companies.isEmpty()) {
+                continue;
             }
+
+            List<Map<String, CellSnapshot>> hitRows =
+                    filterRowsForCompanies(sourceData.rows, companies, extractColumns);
+            if (hitRows.isEmpty()) {
+                log.info("sheet={} 未命中任何数据，跳过生成汇总表", sheetName);
+                continue;
+            }
+            writeSheetWorkbook(outputDir, sheetName, extractColumns, hitRows, sourceData.columnWidthByHeader);
+            generatedCount++;
         }
 
         log.info("客属表数据提取完成，生成文件 {} 个，输出目录: {}", generatedCount, outputDir);
@@ -210,15 +211,29 @@ public class CustomerBelongingDataExtractService {
         return result;
     }
 
-    private List<Map<String, CellSnapshot>> filterRowsForCompany(List<Map<String, CellSnapshot>> rows,
-                                                           String company,
-                                                           List<String> extractColumns) {
+    private Set<String> normalizeCompanies(Set<String> companies) {
+        Set<String> result = new LinkedHashSet<>();
+        if (companies == null) {
+            return result;
+        }
+        for (String company : companies) {
+            String companyName = defaultIfBlank(company, "").trim();
+            if (!companyName.isEmpty()) {
+                result.add(companyName);
+            }
+        }
+        return result;
+    }
+
+    private List<Map<String, CellSnapshot>> filterRowsForCompanies(List<Map<String, CellSnapshot>> rows,
+                                                                   Set<String> companies,
+                                                                   List<String> extractColumns) {
         List<Map<String, CellSnapshot>> result = new ArrayList<>();
         for (Map<String, CellSnapshot> row : rows) {
             String supplier = defaultIfBlank(asText(row.get(SUPPLIER_COL)), "").trim();
             String demander = defaultIfBlank(asText(row.get(DEMANDER_COL)), "").trim();
-            boolean isSupplier = company.equals(supplier);
-            boolean isDemander = company.equals(demander);
+            boolean isSupplier = companies.contains(supplier);
+            boolean isDemander = companies.contains(demander);
             if (!isSupplier && !isDemander) {
                 continue;
             }
@@ -236,12 +251,12 @@ public class CustomerBelongingDataExtractService {
         return result;
     }
 
-    private void writeCompanyWorkbook(Path sheetOutputDir,
-                                      String companyName,
-                                      List<String> extractColumns,
-                                      List<Map<String, CellSnapshot>> rows,
-                                      Map<String, Integer> sourceColumnWidthByHeader) throws IOException {
-        Path file = sheetOutputDir.resolve(sanitizeName(companyName, "company") + "-汇总表.xlsx");
+    private void writeSheetWorkbook(Path outputDir,
+                                    String sheetName,
+                                    List<String> extractColumns,
+                                    List<Map<String, CellSnapshot>> rows,
+                                    Map<String, Integer> sourceColumnWidthByHeader) throws IOException {
+        Path file = outputDir.resolve(sanitizeName(sheetName, "sheet") + "-汇总表.xlsx");
         try (Workbook wb = new XSSFWorkbook()) {
             Sheet outSheet = wb.createSheet("汇总");
             Map<String, CellStyle> dataFormatStyleCache = new HashMap<>();

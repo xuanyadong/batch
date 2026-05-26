@@ -11,9 +11,9 @@ contract:
 
 # 提单批量生成配置
 bill-of-lading:
-  data-path: C:\Users\Skye ding\Desktop\batch\batch\数据模板.xlsx
-  template-path: C:\Users\Skye ding\Desktop\batch\batch\bill-of-lading.xlsx
-  output-dir: C:\Users\Skye ding\Desktop\batch\batch\output_bill
+  data-path: D:\test\batch\数据模板.xlsx
+  template-path: D:\test\batch\bill-of-lading.xlsx
+  output-dir: D:\test\batch\output_bill
   output-file-name-pattern: "提单-${供方简称}-${需方简称}-${提单编号}.xls"
   split-min: 50
   split-max: 495
