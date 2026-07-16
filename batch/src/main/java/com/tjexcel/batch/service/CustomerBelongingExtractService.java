@@ -91,7 +91,6 @@ public class CustomerBelongingExtractService {
         Path groupedDir = workRoot.resolve("grouped");
         Files.createDirectories(unzipDir);
         Files.createDirectories(groupedDir);
-        ensureSheetFolders(groupedDir, companiesBySheet.keySet());
 
         int matchedCount = extractAndGroup(copiedZip, unzipDir, groupedDir, companiesBySheet);
         int zipCount = zipEachSheetFolder(groupedDir, outputDir);
@@ -276,15 +275,6 @@ public class CustomerBelongingExtractService {
                 }
             }
             return sb.toString();
-        }
-    }
-
-    private void ensureSheetFolders(Path groupedDir, Set<String> sheetNames) throws IOException {
-        for (String sheet : sheetNames) {
-            if (sheet == null || sheet.trim().isEmpty()) {
-                continue;
-            }
-            Files.createDirectories(groupedDir.resolve(sheet));
         }
     }
 
